@@ -13,9 +13,11 @@ import matplotlib.gridspec as gridspec
 import seaborn as sns
 
 from . import performance as pfm
+import jaqs.util as jutil
 
 
 DECIMAL_TO_BPS = 10000
+DECIMAL_TO_PCT = 100
 
 
 # -----------------------------------------------------------------------------------
@@ -123,27 +125,43 @@ def axes_style(style='darkgrid', rc=None):
 
 class GridFigure(object):
     def __init__(self, rows, cols, height_ratio=1.0):
-        self.rows = rows
+        self.rows = rows * 2
         self.cols = cols
         self.fig = plt.figure(figsize=(14, rows * 7 * height_ratio))
-        self.gs = gridspec.GridSpec(rows, cols, wspace=0.1, hspace=0.5)
+        self.gs = gridspec.GridSpec(self.rows, self.cols, wspace=0.1, hspace=0.5)
         self.curr_row = 0
         self.curr_col = 0
+        
+        self._in_row = False
     
     def next_row(self):
-        if self.curr_col != 0:
-            self.curr_row += 1
+        if self._in_row:
+            self.curr_row += 2
             self.curr_col = 0
+            self._in_row = False
+        
+        subplt = plt.subplot(self.gs[self.curr_row: self.curr_row + 2, :])
+        self.curr_row += 2
+        return subplt
+    
+    def next_subrow(self):
+        if self._in_row:
+            self.curr_row += 2
+            self.curr_col = 0
+            self._in_row = False
+        
         subplt = plt.subplot(self.gs[self.curr_row, :])
         self.curr_row += 1
         return subplt
     
     def next_cell(self):
-        if self.curr_col >= self.cols:
-            self.curr_row += 1
-            self.curr_col = 0
-        subplt = plt.subplot(self.gs[self.curr_row, self.curr_col])
+        subplt = plt.subplot(self.gs[self.curr_row: self.curr_row + 2, self.curr_col])
         self.curr_col += 1
+        self._in_row = True
+        if self.curr_col >= self.cols:
+            self.curr_row += 2
+            self.curr_col = 0
+            self._in_row = False
         return subplt
 
 
@@ -263,12 +281,14 @@ def plot_quantile_returns_ts(mean_ret_by_q, ax=None):
     
     ret_wide = pd.concat({k: v['mean'] for k, v in mean_ret_by_q.items()}, axis=1)
     ret_wide.index = pd.to_datetime(ret_wide.index, format="%Y%m%d")
+    ret_wide = ret_wide.mul(DECIMAL_TO_PCT)
     # ret_wide = ret_wide.rolling(window=22).mean()
     
     ret_wide.plot(lw=1.2, ax=ax, cmap=cm.get_cmap('RdBu'))
+    df = pd.DataFrame()
     ax.legend(loc='upper left')
     ymin, ymax = ret_wide.min().min(), ret_wide.max().max()
-    ax.set(ylabel='Return',
+    ax.set(ylabel='Return (%)',
            title="Daily Quantile Return (equal weight within quantile)",
            xlabel='Date',
            # yscale='symlog',
@@ -336,9 +356,9 @@ def plot_mean_quantile_returns_spread_time_series(mean_returns_spread, period,
         f, ax = plt.subplots(figsize=(18, 6))
     
     mean_returns_spread.index = pd.to_datetime(mean_returns_spread.index, format="%Y%m%d")
-    mean_returns_spread_bps = mean_returns_spread['mean_diff'] * DECIMAL_TO_BPS
+    mean_returns_spread_bps = mean_returns_spread['mean_diff'] * DECIMAL_TO_PCT
 
-    std_err_bps = mean_returns_spread['std'] * DECIMAL_TO_BPS
+    std_err_bps = mean_returns_spread['std'] * DECIMAL_TO_PCT
     upper = mean_returns_spread_bps.values + (std_err_bps * bandwidth)
     lower = mean_returns_spread_bps.values - (std_err_bps * bandwidth)
     
@@ -352,7 +372,7 @@ def plot_mean_quantile_returns_spread_time_series(mean_returns_spread, period,
 
     ax.legend(['mean returns spread', '1 month moving avg'], loc='upper right')
     ylim = np.nanpercentile(abs(mean_returns_spread_bps.values), 95)
-    ax.set(ylabel='Difference In Quantile Mean Return (bps)',
+    ax.set(ylabel='Difference In Quantile Mean Return (%)',
            xlabel='',
            title=title,
            ylim=(-ylim, ylim))
@@ -384,14 +404,15 @@ def plot_cumulative_return(ret, ax=None, title=None):
     
     cum = ret  # pfm.daily_ret_to_cum(ret)
     cum.index = pd.to_datetime(cum.index, format="%Y%m%d")
+    cum = cum.mul(DECIMAL_TO_PCT)
     
     cum.plot(ax=ax, lw=3, color='indianred', alpha=1.0)
     ax.axhline(0.0, linestyle='-', color='black', lw=1)
     
     metrics = pfm.calc_performance_metrics(cum, cum_return=True, compound=False)
     ax.text(.85, .30,
-            "Ann.Ret. = {:.1f}%\nAnn.Vol. = {:.1f}%\nSharpe = {:.2f}".format(metrics['ann_ret']*100,
-                                                                           metrics['ann_vol']*100,
+            "Ann.Ret. = {:.1f}%\nAnn.Vol. = {:.1f}%\nSharpe = {:.2f}".format(metrics['ann_ret'],
+                                                                           metrics['ann_vol'],
                                                                            metrics['sharpe']),
             fontsize=12,
             bbox={'facecolor': 'white', 'alpha': 1, 'pad': 5},
@@ -399,7 +420,7 @@ def plot_cumulative_return(ret, ax=None, title=None):
             verticalalignment='top')
     if title is None:
         title = "Cumulative Return"
-    ax.set(ylabel='Cumulative Return',
+    ax.set(ylabel='Cumulative Return (%)',
            title=title,
            xlabel='Date')
     
@@ -427,13 +448,14 @@ def plot_cumulative_returns_by_quantile(quantile_ret, ax=None):
     
     cum_ret = quantile_ret
     cum_ret.index = pd.to_datetime(cum_ret.index, format="%Y%m%d")
+    cum_ret = cum_ret.mul(DECIMAL_TO_PCT)
     
     cum_ret.plot(lw=2, ax=ax, cmap=cm.get_cmap('RdBu'))
     ax.axhline(0.0, linestyle='-', color='black', lw=1)
     
     ax.legend(loc='upper left')
     ymin, ymax = cum_ret.min().min(), cum_ret.max().max()
-    ax.set(ylabel='Cumulative Returns',
+    ax.set(ylabel='Cumulative Returns (%)',
            title='Cumulative Return of Each Quantile (equal weight within quantile)',
            xlabel='Date',
            # yscale='symlog',
@@ -442,7 +464,7 @@ def plot_cumulative_returns_by_quantile(quantile_ret, ax=None):
     
     sharpes = ["sharpe_{:d} = {:.2f}".format(col, pfm.calc_performance_metrics(ser, cum_return=True,
                                                                                compound=False)['sharpe'])
-               for col, ser in cum_ret.items()]
+               for col, ser in cum_ret.iteritems()]
     ax.text(.02, .30,
             '\n'.join(sharpes),
             fontsize=12,
@@ -572,6 +594,18 @@ def plot_monthly_ic_heatmap(mean_monthly_ic, period, ax=None):
     ax : matplotlib.Axes
         The axes that were plotted on.
     """
+    MONTH_MAP = {1: 'Jan',
+                 2: 'Feb',
+                 3: 'Mar',
+                 4: 'Apr',
+                 5: 'May',
+                 6: 'Jun',
+                 7: 'Jul',
+                 8: 'Aug',
+                 9: 'Sep',
+                 10: 'Oct',
+                 11: 'Nov',
+                 12: 'Dec'}
     
     mean_monthly_ic = mean_monthly_ic.copy()
     
@@ -587,14 +621,15 @@ def plot_monthly_ic_heatmap(mean_monthly_ic, period, ax=None):
     new_index_month = []
     for date in mean_monthly_ic.index:
         new_index_year.append(date.year)
-        new_index_month.append(date.month)
+        new_index_month.append(MONTH_MAP[date.month])
     
     mean_monthly_ic.index = pd.MultiIndex.from_arrays(
             [new_index_year, new_index_month],
             names=["year", "month"])
     
+    ic_year_month = mean_monthly_ic['ic'].unstack()
     sns.heatmap(
-            mean_monthly_ic.unstack(),
+            ic_year_month,
             annot=True,
             alpha=1.0,
             center=0.0,
@@ -613,22 +648,121 @@ def plot_monthly_ic_heatmap(mean_monthly_ic, period, ax=None):
 
 # -----------------------------------------------------------------------------------
 # Functions to Plot Others
-def plot_event_bar(mean_ret, ax):
-    ax.bar(mean_ret.index, mean_ret.values * DECIMAL_TO_BPS, width=8.0)
+def plot_event_bar_OLD(mean, std, ax):
+    idx = mean.index
     
-    ax.set(xlabel='Period Length', ylabel='bps')
-    ax.legend(list(map(lambda x: str(x), mean_ret.index.values)))
+    DECIMAL_TO_PERCENT = 100.0
+    ax.errorbar(idx, mean * DECIMAL_TO_PERCENT, yerr=std * DECIMAL_TO_PERCENT,
+                marker='o',
+                ecolor='lightblue', elinewidth=5)
+    
+    ax.set(xlabel='Period Length (trade days)', ylabel='Return (%)',
+           title="Annual Return Mean and StdDev")
+    ax.set(xticks=idx)
     return ax
 
 
-def plot_event_dist(df_events, axs):
+def plot_event_bar(df, x, y, hue, ax):
+    DECIMAL_TO_PERCENT = 100.0
+    
+    n = len(np.unique(df[hue]))
+    palette_gen = (c for c in sns.color_palette("Reds_r", n))
+    
+    gp = df.groupby(hue)
+    
+    for p, dfgp in gp:
+        idx = dfgp[x]
+        mean = dfgp[y]
+        # std = dfgp['Annu. Vol.']
+        c = next(palette_gen)
+        
+        ax.errorbar(idx, mean * DECIMAL_TO_PERCENT,
+                    marker='o', color=c,
+                    # yerr=std * DECIMAL_TO_PERCENT, ecolor='lightblue', elinewidth=5,
+                    label="{}".format(p))
+    ax.axhline(0.0, color='k', ls='--', lw=1, alpha=.5)
+    ax.set(xlabel='Period Length (trade days)', ylabel='Return (%)',
+           title="Average Annual Return")
+    ax.legend(loc='upper right')
+    ax.set(xticks=idx)
+    return ax
+
+
+def plot_event_dist(df_events, date, axs):
     i = 0
-    for period, ser in df_events.items():
+    for period, ser in df_events.iteritems():
         ax = axs[i]
         sns.distplot(ser, ax=ax)
-        ax.set(xlabel='Return', ylabel='',
-               title="Distribution of return after {:d} trade dats".format(period))
+        ax.axvline(ser.mean(), lw=1, ls='--', label='Average', color='red')
+        ax.legend(loc='upper left')
+        ax.set(xlabel='Return (%)', ylabel='',
+               title="{} Distribution of return after {:d} trade dats".format(date, period))
         # self.show_fig(fig, 'event_return_{:d}days.png'.format(my_period))
         i += 1
     
     # print(mean)
+
+
+'''
+def plot_event_dist_NEW(df_events, axs, grouper=None):
+    i = 0
+    def _plot(ser):
+        ax = axs[i]
+        sns.distplot(ser, ax=ax)
+        ax.axvline(ser.mean(), lw=1, ls='--', label='Average', color='red')
+        ax.legend(loc='upper left')
+        ax.set(xlabel='Return (%)', ylabel='',
+               title="Distribution of return after {:d} trade dats".format(period))
+    if grouper is None:
+    
+    for (date, period), row in df_events.iterrows():
+        ax = axs[i]
+        sns.distplot(ser, ax=ax)
+        ax.axvline(ser.mean(), lw=1, ls='--', label='Average', color='red')
+        ax.legend(loc='upper left')
+        ax.set(xlabel='Return (%)', ylabel='',
+               title="Distribution of return after {:d} trade dats".format(period))
+        # self.show_fig(fig, 'event_return_{:d}days.png'.format(my_period))
+        i += 1
+        
+        # print(mean)
+
+'''
+def plot_calendar_distribution(signal, monthly_signal, yearly_signal, ax1, ax2):
+    idx = signal.index.values
+    start = jutil.convert_int_to_datetime(idx[0]).date()
+    end = jutil.convert_int_to_datetime(idx[-1]).date()
+    count = np.sum(yearly_signal.values.flatten())
+
+    print("\n       " + "Calendar Distribution    ({} occurance from {} to {}):".format(count, start, end))
+
+    # fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(16, 12), dpi=72)
+
+    # sns.barplot(data=monthly_signal.reset_index(), x='Month', y='Time', ax=ax1£©
+    # sns.barplot(x=monthly_signal.index.values, y=monthly_signal.values, ax=ax1)
+    ax1.bar(monthly_signal.index, monthly_signal['Time'].values)
+    ax1.axhline(monthly_signal.values.mean(), lw=1, ls='--', color='red', label='Average')
+    ax1.legend(loc='upper right')
+    months_str = ['Jan', 'Feb', 'March', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+    ax1.set(xticks=range(len(months_str)), xticklabels=months_str,
+            title="Monthly Distribution",
+            xlabel='Month', ylabel='Time')
+
+    # sns.barplot(data=yearly_signal.reset_index(), x='Year', y='Times', ax=ax2, color='forestgreen')
+    ax2.bar(yearly_signal.index, yearly_signal['Time'].values)
+    ax2.axhline(yearly_signal.values.mean(), lw=1, ls='--', color='red', label='Average')
+    ax2.legend(loc='upper right')
+    ax2.set(xticks=yearly_signal.index,
+            title="Yearly Distribution",
+            xlabel='Month', ylabel='Time')
+
+
+def plot_event_pvalue(pv, ax):
+    idx = pv.index
+    v = pv.values
+    ax.plot(idx, v, marker='D')
+    
+    ax.set(xlabel='Period Length (trade days)', ylabel='p-value',
+           title="P Value of Test: Mean(return) == 0")
+    ax.set(xticks=idx)
+    return ax
