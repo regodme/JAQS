@@ -215,7 +215,8 @@ class RealTimeTradeApi_async(BaseTradeApi, EventEngine):
         print("\n{}@{} login...".format(username, address))
         user_info, msg = tapi.login(username, password)
         print("    Login msg: {:s}".format(msg))
-        print("    Login user info: {:s}\n".format(user_info))
+        print("    Login user info: ", repr(user_info))
+        print("")
         self._trade_api = tapi
 
         # event types and trade_api functions are one-to-one corresponded
@@ -539,7 +540,10 @@ class RealTimeTradeApi(TradeApi):
         self.user_info = user_info
         
         strategy_no = get_from_list_of_dict(dic_list, "strategy_no", 0)
-        self.use_strategy(strategy_no)
+        sid, msg = self.use_strategy(strategy_no)
+        if not msg.split(',')[0] == '0':
+            print(msg)
+            raise RuntimeError("use strategy failed. Please re-try.")
         time.sleep(0.1)
     
     def set_trade_api_callbacks(self):

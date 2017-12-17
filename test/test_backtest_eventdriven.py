@@ -71,8 +71,8 @@ class DoubleMaStrategy(EventDrivenStrategy):
             print("place_order FAILED! msg = {}".format(msg))
     
     """
-    `on_tick` accepts single Quote, while `on_quote` accepts
-    'on_tick' is used for real-time trading, while 'on_quote' is used for backtest
+    `on_tick` accepts single Quote, while `on_bar` accepts
+    'on_tick' is used for real-time trading, while 'on_bar' is used for backtest
     """
     def on_tick(self, quote):
         # 'quote' can be:
@@ -114,7 +114,7 @@ class DoubleMaStrategy(EventDrivenStrategy):
             elif self.pos > 0:
                 self.sell(quote, 2)
 
-    def on_quote(self, quote_dic):
+    def on_bar(self, quote_dic):
         quote = quote_dic.get(self.symbol)
         self.on_tick(quote)
 
@@ -163,7 +163,7 @@ def test_backtest():
 
 def test_livetrade():
     props = {'symbol': 'rb1801.SHF',
-             'strategy_no': 46}
+             'strategy_no': 1044}
     tapi = RealTimeTradeApi(trade_config)
     ins = EventLiveTradeInstance()
     

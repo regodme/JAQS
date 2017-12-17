@@ -107,7 +107,7 @@ def test_dtutil():
 
 
 def test_io():
-    folder_relative = 'output/test/test_file_io'
+    folder_relative = '../output/test/test_file_io'
     folder = jutil.join_relative_path(folder_relative)
     fp = jutil.join_relative_path(folder_relative+'/file.postfix')
     
@@ -116,6 +116,9 @@ def test_io():
     
 
 def test_base64():
+    import matplotlib
+    matplotlib.use('Agg')
+    
     import matplotlib.pyplot as plt
     fig = plt.figure()
     plt.plot(range(10))

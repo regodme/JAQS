@@ -264,7 +264,7 @@ class RemoteDataService(with_metaclass(Singleton, DataService)):
 
     """
     def __init__(self):
-        print("Init RemoteDataService DEBUG")
+        # print("Init RemoteDataService DEBUG")
         super(RemoteDataService, self).__init__()
         
         self.data_api = None
@@ -354,7 +354,8 @@ class RemoteDataService(with_metaclass(Singleton, DataService)):
     
     @staticmethod
     def _raise_error_if_msg(err_msg):
-        if err_msg != '0,':
+        splited = err_msg.split(',')
+        if not (splited and (splited[0] == '0')):
             raise QueryDataError(err_msg)
     
     # -----------------------------------------------------------------------------------
@@ -771,7 +772,7 @@ class RemoteDataService(with_metaclass(Singleton, DataService)):
         dic = dict()
         gp = df_io.groupby(by='symbol')
         for sec, df in gp:
-            mask = np.zeros_like(dates, dtype=int)
+            mask = np.zeros_like(dates, dtype=np.integer)
             for idx, row in df.iterrows():
                 bool_index = np.logical_and(dates > row['in_date'], dates < row['out_date'])
                 mask[bool_index] = 1
@@ -954,7 +955,7 @@ class RemoteDataService(with_metaclass(Singleton, DataService)):
     
     def query_inst_info(self, symbol, inst_type="", fields=""):
         if inst_type == "":
-            inst_type = "1,2,3,4,5,101,102,103,104"
+            inst_type = "1,2,3,4,5,100,101,102,103,104"
         
         filter_argument = self._dic2url({'symbol': symbol,
                                          'inst_type': inst_type})
