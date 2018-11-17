@@ -1,13 +1,20 @@
 # encoding: UTF-8
+"""
+PortfolioManager helps manage strategy's trades, orders, positions, etc.
+
+It binds with a strategy and updates trades/orders/positions when relevant callback
+functions are called.
+
+"""
 
 from __future__ import print_function
-import copy
-from collections import defaultdict
 
+import copy
+
+import jaqs.trade
 from jaqs.data.basic import OrderStatusInd, Trade, Task, Order, Position, TradeStat
 from jaqs.trade import common
-import jaqs.trade
-
+import jaqs.util as jutil
 
 class PortfolioManager(object):
     """
@@ -39,6 +46,9 @@ class PortfolioManager(object):
         self.orders = dict()
         self.tasks = dict()
         self.trades = []
+        self._cum_net_turnover = 0.0
+        self.cash = 0.0
+        self.init_balance = 0.0
         
         self.positions = dict()
         self.tradestat = dict()
@@ -46,6 +56,9 @@ class PortfolioManager(object):
         self.holding_securities = set()
     
     def init_from_config(self, props):
+        self.init_balance = props.get("init_balance", 0.0)
+        self.cash = self.init_balance
+        
         self._hook_strategy()
         if isinstance(self.ctx.trade_api, jaqs.trade.RealTimeTradeApi):
             self.init_positions()
@@ -195,8 +208,8 @@ class PortfolioManager(object):
         
         elif task.function_name == 'goal_portfolio':
             # self._update_trade_stat_from_goal_positions(goal_positions)
-            orders = task.data
-            for order in orders:
+            #orders = task.data
+            for entrust_no, order in task.data.items():
                 self._update_trade_stat_from_order(order)
     
     '''
@@ -339,17 +352,31 @@ class PortfolioManager(object):
     
     def _update_task_if_done(self, task_id):
         task = self.get_task(task_id)
+        if task is None:
+            return
         if task.function_name == 'place_order':
             order = task.data
             if order.is_finished:
                 task.task_status = common.TASK_STATUS.DONE
         elif task.function_name == 'place_batch_order':
             orders = task.data
-            if all([o.is_finished for o in orders]):
+            #if all([o.is_finished for o in orders]):
+            has_unfinished = False
+            for o in orders:
+                if not o.is_finished:
+                    has_unfinished = True
+                    break
+            if not has_unfinished:
                 task.task_status = common.TASK_STATUS.DONE
         elif task.function_name == 'goal_portfolio':
             orders = task.data
-            if all([o.is_finished for o in orders]):
+            #if all([o.is_finished for o in orders]):
+            has_unfinished = False
+            for entrust_no, o in orders.items():
+                if not o.is_finished:
+                    has_unfinished = True
+                    break
+            if not has_unfinished:
                 task.task_status = common.TASK_STATUS.DONE
             '''
             goals = task.data
@@ -383,8 +410,9 @@ class PortfolioManager(object):
         order = self.orders.get(ind.entrust_no, None)
         if order is None:
             order = Order()
+            self.orders[ind.entrust_no] = order
         order.copy(ind)
-        self.orders[ind.entrust_no] = order
+
         
         task = self.get_task(ind.task_id)
         if task.function_name == 'place_order':
@@ -395,13 +423,15 @@ class PortfolioManager(object):
                 if order.entrust_no == ind.entrust_no:
                     order.copy(ind)
         elif task.function_name == 'goal_portfolio':
-            for order in task.data:
-                if order.entrust_no == ind.entrust_no:
-                    order.copy(ind)
-        
+            #for order in task.data:
+            #    if order.entrust_no == ind.entrust_no:
+            if ind.entrust_no in task.data:
+                order = task.data[ind.entrust_no]
+                order.copy(ind)
+
         # order status other than CANCELLED/REJECTED will be dealt with self.on_trade
         if (ind.order_status == common.ORDER_STATUS.CANCELLED) or (ind.order_status == common.ORDER_STATUS.REJECTED):
-            
+
             # update TradeStat
             trade_stat = self._get_trade_stat(ind.symbol)
             
@@ -432,6 +462,7 @@ class PortfolioManager(object):
             else:
                 raise ValueError("order {} does not exist".format(entrust_no))
             """
+
         self.original_on_order_status(ind)
     
     '''
@@ -497,10 +528,13 @@ class PortfolioManager(object):
             else:
                 order.order_status = common.ORDER_STATUS.ACCEPTED
         '''
-        
+
         # Change Position
         self._update_position_by_trade_ind(ind)
-        
+
+        # Update cash
+        self._update_cash_from_trade_ind(ind)
+
         # Change TradeStat
         self._update_trade_stat_from_trade_ind(ind)
 
@@ -514,6 +548,27 @@ class PortfolioManager(object):
         # hook:
         self.original_on_trade(ind)
     
+    def _update_cash_from_trade_ind(self, ind):
+        """
+        
+        Parameters
+        ----------
+        ind : Trade
+
+        """
+        curr_pos = self.get_pos(ind.symbol)
+        turnover = ind.fill_price * ind.fill_size
+        if common.ORDER_ACTION.is_positive(ind.entrust_action):
+            self._cum_net_turnover += turnover
+        else:
+            self._cum_net_turnover -= turnover
+        self.cash = self.init_balance - (self._cum_net_turnover - curr_pos * ind.fill_price)
+        
+        # TODO
+        if self.cash < 0:
+            pass
+            # print("WARNING: cash is not enough when executing trade\n", ind)
+        
     def _update_order_from_trade_ind(self, ind):
         order = self.orders.get(ind.entrust_no)
         if order is None:

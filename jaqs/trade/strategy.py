@@ -1,4 +1,7 @@
 # encoding: utf-8
+"""
+Classes defined in strategy module
+"""
 
 from __future__ import print_function
 import abc
@@ -6,9 +9,11 @@ from abc import abstractmethod
 from six import with_metaclass
 
 import numpy as np
+import pandas as pd
 
 from jaqs.data.basic import GoalPosition
 from jaqs.util.sequence import SequenceGenerator
+from jaqs.data.basic import Bar, Quote
 # import jaqs.util as jutil
 
 from jaqs.trade import model
@@ -367,7 +372,12 @@ class AlphaStrategy(Strategy, model.FuncRegisterable):
     # TODO register context
     def __init__(self, signal_model=None, stock_selector=None,
                  cost_model=None, risk_model=None,
-                 pc_method="equal_weight"):
+                 pc_method="equal_weight",
+                 match_method="vwap",
+                 fc_selector=None,
+                 fc_constructor=None,
+                 fc_options=None
+                 ):
         super(AlphaStrategy, self).__init__()
         
         self.period = ""
@@ -375,6 +385,7 @@ class AlphaStrategy(Strategy, model.FuncRegisterable):
         self.days_delay = 0
         self.cash = 0
         self.position_ratio = 0.98
+        self.single_symbol_weight_limit = 1.0
         
         self.risk_model = risk_model
         self.signal_model = signal_model
@@ -384,8 +395,14 @@ class AlphaStrategy(Strategy, model.FuncRegisterable):
         self.weights = None
         
         self.pc_method = pc_method
-        
+
         self.goal_positions = None
+        self.match_method = match_method
+
+        self.portfolio_construction = self.forecast_portfolio_construction if pc_method=="forecast" else self.default_portfolio_construction
+        self._fc_selector    = fc_selector if fc_selector else AlphaStrategy.default_forecast_selector
+        self._fc_constructor = fc_constructor if fc_constructor else AlphaStrategy.default_forecast_constructor
+        self._fc_options     = fc_options
 
     def init_from_config(self, props):
         Strategy.init_from_config(self, props)
@@ -395,7 +412,10 @@ class AlphaStrategy(Strategy, model.FuncRegisterable):
         self.days_delay = props.get('days_delay', 0)
         self.n_periods = props.get('n_periods', 1)
         self.position_ratio = props.get('position_ratio', 0.98)
+        self.single_symbol_weight_limit = props.get('single_symbol_weight_limit', 1.0)
 
+        self.use_pc_method(name='industry_neutral_equal_weight', func=self.industry_neutral_equal_weight, options=None)
+        self.use_pc_method(name='industry_neutral_index_weight', func=self.industry_neutral_index_weight, options=None)
         self.use_pc_method(name='equal_weight', func=self.equal_weight, options=None)
         self.use_pc_method(name='mc', func=self.optimize_mc, options={'util_func': self.util_net_signal,
                                                                            'constraints': None,
@@ -403,7 +423,9 @@ class AlphaStrategy(Strategy, model.FuncRegisterable):
         self.use_pc_method(name='factor_value_weight', func=self.factor_value_weight, options=None)
         self.use_pc_method(name='index_weight', func=self.index_weight, options=None)
         self.use_pc_method(name='market_value_weight', func=self.market_value_weight, options=None)
-        
+        self.use_pc_method(name='market_value_sqrt_weight', func=self.market_value_weight, options={'sqrt': True})
+        self.use_pc_method(name='equal_index_weight', func=self.equal_index_weight, options=None)
+
         self._validate_parameters()
         print("AlphaStrategy Initialized.")
     
@@ -414,7 +436,15 @@ class AlphaStrategy(Strategy, model.FuncRegisterable):
         elif self.pc_method in ['factor_value_weight']:
             if self.signal_model is None:
                 raise ValueError("signal_model must be provided when pc_method = 'factor_value_weight'")
-        elif self.pc_method in ['equal_weight', 'index_weight', 'market_value_weight']:
+        elif self.pc_method in ['equal_weight',
+                                'index_weight',
+                                'equal_index_weight',
+                                'market_value_weight',
+                                'market_value_sqrt_weight',
+                                'industry_neutral_index_weight',
+                                'industry_neutral_equal_weight']:
+            pass
+        elif self.pc_method in ['forecast']:
             pass
         else:
             raise NotImplementedError("pc_method = {:s}".format(self.pc_method))
@@ -463,8 +493,9 @@ class AlphaStrategy(Strategy, model.FuncRegisterable):
         cost_coef = 1.0
         net_signal = signal - risk_coef * risk - cost_coef * cost  # - liquid * liq_factor
         return net_signal
-    
-    def portfolio_construction(self, universe_list=None):
+
+
+    def default_portfolio_construction(self, universe_list=None):
         """
         Calculate target weights of each symbol in the strategy universe.
         User should not modify this function arbitrarily.
@@ -483,17 +514,25 @@ class AlphaStrategy(Strategy, model.FuncRegisterable):
         # Step.1 filter and narrow down universe to sub-universe
         if self.stock_selector is not None:
             selected_list = self.stock_selector.get_selection()
-            universe_list = [s for s in universe_list if s in selected_list]
+            if type(selected_list) is pd.DataFrame:
+                self.ctx.forecast_selected_list = selected_list
+                universe_list = [s for s in universe_list if s in selected_list['symbol']]
+            else:
+                universe_list = [s for s in universe_list if s in selected_list]
+
         sub_univ = sorted(universe_list)
-        
+
         self.ctx.snapshot_sub = self.ctx.snapshot.loc[sub_univ, :]
-        
+
         # Step.2 pick the registered portfolio construction method
+
         rf = self.func_table[self.pc_method]
         func, options = rf.func, rf.options
 
         # Step.3 use the registered method to calculate weights and get weights for all symbols in universe
         weights_sub_universe, msg = func(**options)
+
+        # portfolio balance check
         weights_all_universe = {symbol: weights_sub_universe.get(symbol, 0.0) for symbol in self.ctx.universe}
         if msg:
             print(msg)
@@ -505,15 +544,185 @@ class AlphaStrategy(Strategy, model.FuncRegisterable):
         w_sum = np.sum(np.abs(list(weights_all_universe.values())))
         if w_sum > 1e-8:  # else all zeros weights
             weights_all_universe = {k: v / w_sum for k, v in weights_all_universe.items()}
+        
+        # single symbol weight limit process
+        if self.single_symbol_weight_limit < 1:
+            weights_all_universe = {k: v if v < self.single_symbol_weight_limit else self.single_symbol_weight_limit
+                                    for k, v in weights_all_universe.items()}
 
         self.weights = weights_all_universe
+
+    def forecast_portfolio_construction(self, universe_list=None):
+
+        assert callable(self._fc_selector), "fc_selector should be function"
+        assert callable(self._fc_constructor), "fc_constuctor should be function"
+
+        forecast_list = self._fc_selector(self, universe=universe_list)
+
+        options = {}
+        if self._fc_options:
+            options.update(self._fc_options)
+
+        self.weights = self._fc_constructor(self,
+                                            self.weights.copy() if self.weights else [],
+                                            forecast_list,
+                                            **options)
+
+    @staticmethod
+    def default_forecast_selector(self, forecast_field='close_adj', universe=None):
+        forecast = self.ctx.dataview.get_snapshot(self.ctx.trade_date)[[forecast_field]].copy()
+        forecast = forecast.rename( columns={forecast_field: "forecast"})
+        forecast['symbol'] = forecast.index
+        return forecast
+
+    @staticmethod
+    def default_forecast_constructor(self, cur_weights, forecast,
+                                     max_turnover=1,
+                                     alpha_threshold=0.0005,
+                                     turnover_cost_rate=0.001,
+                                     init_size=20):
+
+        forecast = forecast.sort_values(['forecast'], ascending=False)
+        forecast.index = forecast['symbol']
+        if not cur_weights:
+            new_weights = forecast[:init_size].copy()
+            new_weights.loc[:, 'weight'] = 1.0 / len(forecast)
+            new_weights.index = new_weights['symbol']
+            return new_weights[['weight']].T.to_dict(orient='records')[0]
+
+        cur_weights = pd.DataFrame({'symbol': list(cur_weights.keys()), 'weight': list(cur_weights.values())})
+        zero_weights = cur_weights[cur_weights['weight'] == 0].copy()
+        cur_weights = cur_weights[cur_weights['weight'] > 0].copy()
+        cur_weights.index = cur_weights['symbol']
+
+        cur_weights['forecast'] = forecast['forecast']
+        cur_weights['forecast'] = cur_weights['forecast'].fillna(0.0)
+        cur_weights = cur_weights.sort_values(['forecast'])
+        cur_weights['handled'] = False
+
+        turnover = 0.0
+        new_weights = []
+        for i in range(len(forecast)):
+            fc = forecast.iloc[i]
+            replaced = False
+            if fc['symbol'] not in cur_weights['symbol']:
+                for k in range(len(cur_weights)):
+                    tmp = cur_weights.iloc[k]
+                    if fc['forecast'] > tmp['forecast'] + turnover_cost_rate + alpha_threshold and \
+                            tmp['weight'] + turnover <= max_turnover:
+                        new_weights.append({'symbol': fc['symbol'], 'weight': tmp['weight']})
+                        new_weights.append({'symbol': tmp['symbol'], 'weight': 0})
+                        cur_weights['handled'][0] = True
+                        turnover += tmp['weight']
+                        replaced = True
+                        break
+                if not replaced:
+                    break
+            else:
+                tmp = cur_weights.loc[fc['symbol']]
+                cur_weights.loc[fc['symbol'], 'handled'] = True
+                new_weights.append({'symbol': fc['symbol'], 'weight': tmp['weight']})
+
+            cur_weights = cur_weights[cur_weights['handled'] != True].copy()
+            if cur_weights.empty or turnover >= max_turnover:
+                break
+
+        if not cur_weights.empty:
+            for i in range(len(cur_weights)):
+                tmp = cur_weights.iloc[i]
+                new_weights.append({'symbol': tmp['symbol'], 'weight': tmp['weight']})
+
+        new_weights = pd.DataFrame(new_weights)
+        w_sum = new_weights['weight'].sum()
+        if w_sum > 1e-8:  # else all zeros weights
+            new_weights.loc[:, 'weight'] /= w_sum
+
+        # Keep all removed stocks in weight, so when stock can be sold after it is tradable again after suspended.
+        tmp = zero_weights[ ~zero_weights['symbol'].isin(new_weights['symbol']) ]
+        if not tmp.empty:
+            new_weights = pd.concat([new_weights, tmp])
+
+        new_weights.index = new_weights['symbol']
+        del new_weights['symbol']
+
+        return new_weights.T.to_dict(orient='records')[0]
 
     def equal_weight(self):
         # discrete
         weights = {k: 1.0 for k in self.ctx.snapshot_sub.index.values}
         return weights, ''
 
-    def market_value_weight(self):
+    def industry_neutral_equal_weight(self):
+        snap = self.ctx.snapshot_sub
+        snap['symbol'] = snap.index
+
+        # calculate weight distribution of all industry
+        # df_weight = self.ctx.dataview.get_snapshot(self.ctx.trade_date)[['total_mv', 'index_member', 'sw1']]
+        # df_weight = df_weight[df_weight['index_member'] == 1]
+        # df_weight['weight'] = df_weight['total_mv']/df_weight['total_mv'].sum()
+        df_weight = self.ctx.dataview.get_snapshot(self.ctx.trade_date)[['index_weight', 'sw1']]
+        df_weight.columns = ['weight', 'sw1']
+
+        df_industry_weight = df_weight.groupby('sw1')['weight'].sum()
+
+        # industries in portfolio
+        industry_list = list(set(snap['sw1'].values.flatten()))
+        df_industry_weight_sub = df_industry_weight.loc[industry_list]
+        df_industry_weight_sub = pd.DataFrame(df_industry_weight_sub)
+        df_industry_weight_sub.columns = ['weight']
+        df_industry_weight_sub['equal_weight'] = pd.DataFrame(snap.groupby('sw1')['sw1'].count()/len(snap))
+
+        df_industry_weight_sub['dif'] = df_industry_weight_sub['equal_weight'] - df_industry_weight_sub['weight']
+
+        df_industry_weight_sub = df_industry_weight_sub.reset_index()
+
+        count_industry = pd.DataFrame(snap.groupby('sw1')['close'].count()).reset_index()
+        count_industry.columns = ['sw1', 'count']
+        count_industry['internal_weight'] = 1.0/count_industry['count']
+
+        snap = pd.merge(left = snap, right = count_industry[['sw1', 'internal_weight']], how = 'left', on = 'sw1')
+        snap = pd.merge(left = snap, right = df_industry_weight_sub[['sw1', 'norm_weight']], how = 'left', on = 'sw1')
+        snap['weight'] = snap['internal_weight'] * snap['norm_weight']
+        df_weight = snap[['symbol','weight']]
+
+        df_weight = df_weight.set_index('symbol')
+        weights = df_weight['weight'].to_dict()
+
+        return weights, ''
+
+    def industry_neutral_index_weight(self):
+        snap = self.ctx.snapshot_sub
+        snap['symbol'] = snap.index
+
+        # calculate weight distribution of all industry
+        df_weight = self.ctx.dataview.get_snapshot(self.ctx.trade_date)[['total_mv', 'index_member', 'sw1']]
+        df_weight = df_weight[df_weight['index_member'] == 1]
+        df_weight['weight'] = df_weight['total_mv']/df_weight['total_mv'].sum()
+        df_industry_weight = df_weight.groupby('sw1')['weight'].sum()
+
+        # industries in portfolio
+        industry_list = list(set(snap['sw1'].values.flatten()))
+        df_industry_weight_sub = df_industry_weight.loc[industry_list]
+        df_industry_weight_sub = pd.DataFrame(df_industry_weight_sub)
+        df_industry_weight_sub.columns = ['weight']
+        df_industry_weight_sub['norm_weight'] = df_industry_weight_sub['weight']/df_industry_weight_sub['weight'].sum()
+        df_industry_weight_sub = df_industry_weight_sub.reset_index()
+
+        count_industry = pd.DataFrame(snap.groupby('sw1')['index_weight'].sum()).reset_index()
+        count_industry.columns = ['sw1', 'agg_index_weight']
+
+        snap = pd.merge(left = snap, right = count_industry[['sw1', 'agg_index_weight']], how = 'left', on = 'sw1')
+        snap['internal_weight'] = snap['index_weight']/snap['agg_index_weight']
+        snap = pd.merge(left = snap, right = df_industry_weight_sub[['sw1', 'norm_weight']], how = 'left', on = 'sw1')
+        snap['weight'] = snap['internal_weight'] * snap['norm_weight']
+        df_weight = snap[['symbol','weight']]
+
+        df_weight = df_weight.set_index('symbol')
+        weights = df_weight['weight'].to_dict()
+
+        return weights, ''
+
+    def market_value_weight(self, sqrt=False):
         snap = self.ctx.snapshot_sub
         # TODO: pass options, instead of hard-code 'total_mv', 'float_mv'
         if 'total_mv' in snap.columns:
@@ -524,6 +733,9 @@ class AlphaStrategy(Strategy, model.FuncRegisterable):
             raise ValueError("market_value_weight is chosen,"
                              "while no [float_mv] or [total_mv] field found in dataview.")
         mv = mv.fillna(0.0)
+        if sqrt:
+            print('sqrt')
+            mv = np.sqrt(mv)
         weights = mv.to_dict()
         return weights, ""
 
@@ -536,7 +748,18 @@ class AlphaStrategy(Strategy, model.FuncRegisterable):
         ser_index_weight.fillna(0.0, inplace=True)
         weights = ser_index_weight.to_dict()
         return weights, ""
-    
+
+    def equal_index_weight(self):
+        snap = self.ctx.snapshot_sub
+        snap.fillna(0.0, inplace=True)
+
+        wt_equal = snap['index_member'] / sum(snap['index_member'])
+        wt_index = snap['index_weight'] / sum(snap['index_weight'])
+
+        wt_final = (wt_equal + wt_index) / 2
+
+        return wt_final.to_dict(), ""
+
     def factor_value_weight(self):
         def long_only_weight_adjust(w):
             """
@@ -635,7 +858,7 @@ class AlphaStrategy(Strategy, model.FuncRegisterable):
     
     def send_bullets(self):
         # self.ctx.trade_api.goal_portfolio_by_batch_order(self.goal_positions)
-        self.ctx.trade_api.goal_portfolio(self.goal_positions, algo='vwap')
+        self.ctx.trade_api.goal_portfolio(self.goal_positions, algo=self.match_method)
     
     def generate_weights_order(self, weights_dic, turnover, prices, suspensions=None):
         """
@@ -701,7 +924,6 @@ class EventDrivenStrategy(Strategy):
         
         super(EventDrivenStrategy, self).__init__()
     
-    @abstractmethod
     def on_bar(self, quote):
         pass
     
@@ -713,6 +935,59 @@ class EventDrivenStrategy(Strategy):
     
     def initialize(self):
         pass
+    
+    def buy_or_sell_with_bar(self, action, bar, size, slippage=0.0):
+        """
+        Send a limit Buy order with quote.close + slippage.
+        
+        Parameters
+        ----------
+        action : {'Buy', 'Sell'}
+        bar : Bar
+        size : int or float
+            Should be positive.
+        slippage : float, optional
+            Should be non-negative
+
+        """
+        if not isinstance(bar, Bar):
+            raise TypeError("quote must be Bar type. You may have passed a Quote.")
+        
+        if action == common.ORDER_ACTION.SELL:
+            slippage *= -1
+        entrust_price = bar.close + slippage
+        task_id, msg = self.ctx.trade_api.place_order(bar.symbol,
+                                                      action,
+                                                      entrust_price,
+                                                      size)
+        if (task_id is None) or (task_id == 0):
+            print("place_order FAILED! msg = {}".format(msg))
+        
+    def buy(self, bar, size=1, slippage=0.0):
+        """
+        Send a limit Buy order with bar.close + slippage.
+        
+        Parameters
+        ----------
+        bar : Bar
+        size : int or float
+        slippage : float
+
+        """
+        self.buy_or_sell_with_bar(common.ORDER_ACTION.BUY, bar, size, slippage)
+
+    def sell(self, bar, size=1, slippage=0.0):
+        """
+        Send a limit Sell order with bar.close + slippage.
+        
+        Parameters
+        ----------
+        bar : Bar
+        size : int or float
+        slippage : float
+
+        """
+        self.buy_or_sell_with_bar(common.ORDER_ACTION.SELL, bar, size, slippage)
 
     def cancel_all_orders(self):
         for task_id, task in self.ctx.pm.tasks.items():

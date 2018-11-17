@@ -1,5 +1,11 @@
-#! /usr/bin/env python
-# -*- coding: utf-8 -*-
+# encoding: utf-8
+"""
+Classes defined in py_expression_eval moduel are used to parse string expressions
+and do corresponding calculations. They are used in DataView. Since expression parsing
+is error-prone, we do not recommend directly modifying this module .
+
+"""
+
 # Author: AxiaCore S.A.S. http://axiacore.com
 #
 # Based on js-expression-eval, by Matthew Crumley (email@matthewcrumley.com, http://silentmatt.com/)
@@ -23,12 +29,46 @@ import pandas as pd
 
 from jaqs.data.align import align
 import jaqs.util.numeric as numeric
+from jaqs.util import rank_with_mask
 
 TNUMBER = 0
 TOP1 = 1
 TOP2 = 2
 TVAR = 3
 TFUNCALL = 4
+
+
+'''
+single quarter / TTM + year on year / month on month
+'''
+
+
+def cum_to_single_quarter(df, report_date):
+    df = df.copy()
+    is_nan = df.isnull()
+    df = df.fillna(method='ffill').fillna(0.0)
+    year = report_date // 10000
+    
+    def cum_to_single_within_year(df_):
+        first_row = df_.iloc[0, :].copy()
+        df_ = df_.diff(1, axis=0)
+        df_.iloc[0, :] = first_row
+        return df_
+    single_quarter = df.groupby(by=year).apply(cum_to_single_within_year)
+    single_quarter[is_nan] = np.nan
+    return single_quarter
+
+
+def calc_ttm(df):
+    return df.rolling(window=4, axis=0).sum()
+
+
+def calc_year_on_year_return(df):
+    return df.pct_change(4, axis=0)
+
+
+def calc_quarter_on_quarter_return(df):
+    return df.pct_change(1, axis=0)
 
 
 class Expression(object):
@@ -183,7 +223,7 @@ class Expression(object):
             item = self.tokens[i]
             if item.type_ == TVAR and \
                     not item.index_ in vars and \
-                    item.index_ not in self.functions:
+                    True : #item.index_ not in self.functions:
                 vars.append(item.index_)
         return vars
 
@@ -207,7 +247,7 @@ class Token(object):
 
 
 class Parser(object):
-    def __init__(self):
+    def __init__(self, allow_future_data =False):
         self.success = False
         self.errormsg = ''
         self.expression = ''
@@ -276,22 +316,32 @@ class Parser(object):
             # cross section
             'Min': np.minimum,
             'Max': np.maximum,
-            'Rank': self.rank,
-            #'Percentile': self.percentile,
+            'Percentile': self.percentile,
+            'GroupPercentile': self.group_percentile,
             'Quantile': self.to_quantile,
-            'Ts_Quantile': self.ts_quantile,
             'GroupQuantile': self.group_quantile,
+            'Rank': self.rank,
             'GroupRank': self.group_rank,
+            'Mask': self.mask,
             'ConditionRank': self.cond_rank,
+            'ConditionPercentile': self.cond_percentile,
+            'ConditionQuantile': self.cond_quantile,
             'Standardize': self.standardize,
             'Cutoff': self.cutoff,
             # 'GroupApply': self.group_apply,
             # time series
+            'CumToSingle': self.cum_to_single,
+            'TTM': self.calc_ttm,
+            'TTM_jl': self.calc_ttm_jli,
+            'YOY': calc_year_on_year_return,
+            'QOQ': calc_quarter_on_quarter_return,
             'Ts_Rank': self.ts_rank,
+            'Ts_Percentile': self.ts_percentile,
+            'Ts_Quantile': self.ts_quantile,
             'Ewma': self.ewma,
             'Sma':self.sma,
-            'Sum': self.sum,
-            'Product': self.product,  # rolling product
+            'Ts_Sum': self.ts_sum,
+            'Ts_Product': self.ts_product,  # rolling product
             'CountNans': self.count_nans,  # rolling count Nans
             'StdDev': self.std_dev,
             'Covariance': self.cov,
@@ -312,8 +362,12 @@ class Parser(object):
             # inplace
             'Pow': np.power,
             'SignedPower': self.signed_power,
+            'IsNan': self.is_nan,
             # others
             'If': self.ifFunction,
+            'FillNan': self.fill_nan,
+            'Return_Abs': self.calc_return_abs,
+            'Return_Fwd': self.calc_return_fwd,
             # test
         }
         
@@ -350,6 +404,8 @@ class Parser(object):
         
         self.ann_dts = None
         self.trade_dts = None
+
+        self.allow_future_data = allow_future_data
     
     # -----------------------------------------------------
     # functions
@@ -378,6 +434,10 @@ class Parser(object):
     
     def pow(self, a, b):
         return np.power(a, b)
+
+    def signed_power(self, x, e):
+        signs = np.sign(x)
+        return signs * np.power(np.abs(x), e)
     
     def concat(self, a, b, *args):
         result = u'{0}{1}'.format(a, b)
@@ -393,10 +453,12 @@ class Parser(object):
             return x
         elif isinstance(x, (int, float, bool, np.integer, np.float, np.bool)):
             return np.asarray(x)
+        else:
+            print(x)
+            raise ValueError("Cannot convert type {} to numpy array".format(repr(type(x))))
     
     def equal(self, a, b):
         (a, b) = self._align_bivariate(a, b)
-        # arr, brr = a.values, b.values
         arr, brr = self._to_array(a), self._to_array(b)
         mask = np.logical_or(np.isnan(arr), np.isnan(brr))
         res = arr == brr
@@ -520,31 +582,31 @@ class Parser(object):
         r = df.ewm(com=a, axis=0)
         return r.mean()
     
-    def corr(self, x, y, n):
-        (x, y) = self._align_bivariate(x, y)
-        return pd.rolling_corr(x, y, n)
-    
-    def cov(self, x, y, n):
-        (x, y) = self._align_bivariate(x, y)
-        return pd.rolling_cov(x, y, n)
-    
     def std_dev(self, x, n):
-        return pd.rolling_std(x, n)
+        return x.rolling(n).std()
     
-    def sum(self, x, n):
-        return pd.rolling_sum(x, n)
+    def ts_sum(self, x, n):
+        return x.rolling(n).sum()
     
     def count_nans(self, x, n):
-        return n - pd.rolling_count(x, n)
+        return n - x.rolling(n).count()
     
     def delay(self, x, n):
+        if not self.allow_future_data and n < 0:
+            raise RuntimeError("Can't use future data")
+
         return x.shift(n)
     
     def delta(self, x, n):
+        if not self.allow_future_data and n < 0:
+            raise RuntimeError("Can't use future data")
+
         return x.diff(n)
     
-    @staticmethod
-    def calc_return(df, forward=1, log=False):
+    def calc_return(self, df, forward=1, log=False):
+        if not self.allow_future_data and forward < 0:
+            raise ValueError("Can't use future data")
+
         if log:
             res = np.log(df).diff(forward)
         else:
@@ -553,25 +615,38 @@ class Parser(object):
         return res
     
     def ts_mean(self, x, n):
-        return pd.rolling_mean(x, n)
+        return x.rolling(n).mean()
     
     def ts_min(self, x, n):
-        return pd.rolling_min(x, n)
+        return x.rolling(n).min()
     
     def ts_max(self, x, n):
-        return pd.rolling_max(x, n)
+        return x.rolling(n).max()
     
     def ts_kurt(self, x, n):
-        return pd.rolling_kurt(x, n)
+        return x.rolling(n).kurt()
     
     def ts_skew(self, x, n):
-        return pd.rolling_skew(x, n)
+        return x.rolling(n).skew()
     
-    def product(self, x, n):
-        return pd.rolling_apply(x, n, np.product)
-
+    def ts_product(self, x, n):
+        return x.rolling(n).apply(np.product)
+    
     @staticmethod
     def ts_rank(df, window):
+        """Return a DataFrame with values ranging from 0.0 to 1.0"""
+        roll = df.rolling(window=window)
+    
+        def _rank_arr(arr, norm=1.0):
+            norm = norm * 1.0
+            ranks = np.argsort(np.argsort(arr))[-1] + 1
+            return ranks / norm
+    
+        res = roll.apply(_rank_arr)
+        return res
+
+    @staticmethod
+    def ts_percentile(df, window):
         """Return a DataFrame with values ranging from 0.0 to 1.0"""
         roll = df.rolling(window=window)
     
@@ -583,6 +658,29 @@ class Parser(object):
         res = roll.apply(_rank_arr, kwargs={'norm': window})
         return res
 
+    # Time Series Two Parameters
+    def corr(self, x, y, n):
+        (x, y) = self._align_bivariate(x, y)
+        return x.rolling(n).corr(y)
+
+    def cov(self, x, y, n):
+        (x, y) = self._align_bivariate(x, y)
+        return x.rolling(n).cov(y)
+
+    # financial statement data
+    @staticmethod
+    def calc_ttm(df):
+        return calc_ttm(cum_to_single_quarter(df, df.index))
+    
+    @staticmethod
+    def calc_ttm_jli(df):
+        return calc_ttm(df)
+
+    @staticmethod
+    def cum_to_single(df):
+        return cum_to_single_quarter(df, df.index)
+
+    # no use
     def step(self, x, n):
         st = x.copy()
         n = n + 1
@@ -604,23 +702,73 @@ class Parser(object):
         return np.dot(x, step) / np.sum(step)
     
     def decay_linear(self, x, n):
-        return pd.rolling_apply(x, n, self.decay_linear_array)
+        return x.rolling(n).apply(self.decay_linear_array)
     
     def decay_exp(self, x, f, n):
-        return pd.rolling_apply(x, n, self.decay_exp_array, args=[f])
+        return x.rolling(n).apply(self.decay_exp_array, args=[f])
     
-    def signed_power(self, x, e):
-        signs = np.sign(x)
-        return signs * np.power(np.abs(x), e)
+    @staticmethod
+    def is_nan(df):
+        return df.isnull()
+
+    def fill_nan(self, df, value=None, fmethod = 'ffill'):
+        if value != None:
+            df = df.fillna(value=value)
+            return df
+        else:
+            df = df.fillna(method = fmethod)
+            return df
+
+    def calc_return_abs(self, df, forward=1):
+        if not self.allow_future_data and forward < 0:
+            raise RuntimeError("Can't use future data")
+
+
+        shift = df.shift(forward)
+        res = (df - shift) / abs(shift)
+        return res
+
+    def calc_return_fwd(self, df, forward=1):
+        if not self.allow_future_data and forward > 0:
+            raise RuntimeError("Can't use future data")
+
+        shift = df.shift(-forward)
+        res = (shift - df) / df
+        return res
 
     # -----------------------------------------------------
     # Cross Section functions
-    def cond_rank(self, x, group):
-        x, group = self._align_bivariate(x, group)
-        group = group.fillna(0.0).astype(bool)
-        g_rank = x[group]
-        return g_rank.rank(axis=1).div((group.shape[1] - group.isnull().sum(axis=1)), axis=0)
+    
+    @staticmethod
+    def mask(df, mask):
+        df[mask] = np.nan
+        return df
+        
+    def cond_rank(self, df, cond):
+        cond = cond.fillna(0.0).astype(bool)
+        df, cond = self._align_bivariate(df, cond)
+        df = self._mask_non_index_member(df)
 
+        rank = rank_with_mask(df, mask=cond, axis=1, normalize=False)
+        return rank
+
+    def cond_percentile(self, df, cond):
+        cond = cond.fillna(0.0).astype(bool)
+        df, cond = self._align_bivariate(df, cond)
+        df = self._mask_non_index_member(df)
+    
+        rank = rank_with_mask(df, mask=cond, axis=1, normalize=True)
+        return rank
+
+    def cond_quantile(self, df, cond, n_quantiles):
+        cond = cond.fillna(0.0).astype(bool)
+        df, cond = self._align_bivariate(df, cond)
+        df = self._mask_non_index_member(df)
+        
+        res_arr = numeric.quantilize_without_nan(df[cond].values, n_quantiles=n_quantiles, axis=1)
+        res = pd.DataFrame(index=df.index, columns=df.columns, data=res_arr)
+        return res
+    
     # -----------------------------------------------------
     # cross section functions
     def _mask_non_index_member(self, df):
@@ -628,21 +776,59 @@ class Parser(object):
             self.index_member = self.index_member.astype(bool)
             df[~self.index_member] = np.nan
         return df
+    
+    @staticmethod
+    def _mask_df(df, mask):
+        if mask is not None:
+            mask = mask.astype(bool)
+            df[~mask] = np.nan
+        return df
 
-    def rank(self, df):
+    def rank(self, df, mask=None):
         """Return a DataFrame with values ranging from 0.0 to 1.0"""
         df = self._align_univariate(df)
         df = self._mask_non_index_member(df)
-        return df.rank(axis=1).div((df.shape[1] - df.isnull().sum(axis=1)), axis=0)
+        df = self._mask_df(df, mask)
+        
+        rank = rank_with_mask(df, axis=1, normalize=False)
+        return rank
 
+    def percentile(self, df, mask=None):
+        """Return a DataFrame with values ranging from 0.0 to 1.0"""
+        df = self._align_univariate(df)
+        df = self._mask_non_index_member(df)
+        df = self._mask_df(df, mask)
+        
+        rank = rank_with_mask(df, axis=1, normalize=True)
+        return rank
+    
     # TODO: all cross-section operations support in-group modification: neutral, extreme values, standardize.
-    def group_rank(self, x, group):
-        x = self._align_univariate(x)
-        x = self._mask_non_index_member(x)
-        vals = np.unique(group.values.flatten())
+    def group_rank(self, df, group, mask=None):
+        df = self._align_univariate(df)
+        df = self._mask_non_index_member(df)
+        df = self._mask_df(df, mask)
+        
+        vals = np.unique(pd.Series(group.values.flatten()).dropna())
         res = None
         for val in vals:
-            rank = x[group == val].rank(axis=1, na_option='keep')
+            mask = (group == val)
+            rank = rank_with_mask(df, mask=mask, axis=1, normalize=False)
+            if res is None:
+                res = rank
+            else:
+                res = res.fillna(rank)
+        return res
+    
+    def group_percentile(self, df, group, mask=None):
+        df = self._align_univariate(df)
+        df = self._mask_non_index_member(df)
+        df = self._mask_df(df, mask)
+        
+        vals = np.unique(pd.Series(group.values.flatten()).dropna())
+        res = None
+        for val in vals:
+            mask = (group == val)
+            rank = rank_with_mask(df, mask=mask, axis=1, normalize=True)
             if res is None:
                 res = rank
             else:
@@ -656,7 +842,7 @@ class Parser(object):
         res = roll.apply(func)
         return res
     
-    def to_quantile(self, df, n_quantiles=5, axis=1):
+    def to_quantile(self, df, n_quantiles=5, axis=1, mask=None):
         """
         Convert cross-section values to the quantile number they belong.
         Small values get small quantile numbers.
@@ -678,6 +864,8 @@ class Parser(object):
         """
         df = self._align_univariate(df)
         df = self._mask_non_index_member(df)
+        df = self._mask_df(df, mask)
+
         # TODO: unnecesssary warnings
         # import warnings
         # warnings.filterwarnings(action='ignore', category=RuntimeWarning, module='py_exp')
@@ -685,12 +873,15 @@ class Parser(object):
         res = pd.DataFrame(index=df.index, columns=df.columns, data=res_arr)
         return res
 
-    def group_quantile(self, df, group, n_quantiles=5):
+    def group_quantile(self, df, group, n_quantiles=5, mask=None):
         df = self._align_univariate(df)
         df = self._mask_non_index_member(df)
-        
+        df = self._mask_df(df, mask)
+
+
         res = None
-        for val in np.unique(group.values.flatten()):
+        groups = np.unique(pd.Series(group.values.flatten()).dropna())
+        for val in groups:
             val_res = self.to_quantile(df[group == val], n_quantiles=n_quantiles)
             if res is None:
                 res = val_res
@@ -1061,6 +1252,7 @@ class Parser(object):
                 n1 = nstack.pop()
                 f = nstack.pop()
                 if callable(f):
+                    # FIXME: Should set value for factor if it is in list.
                     if type(n1) is list:
                         nstack.append(f(*n1))
                     else:

@@ -106,6 +106,20 @@ def test_dtutil():
         assert datetime.datetime.strptime(str(monthly), "%Y%m%d").weekday() < 5
 
 
+def test_rank_percentile():
+    df = pd.DataFrame(np.random.rand(500, 3000))
+    res1 = jutil.rank_with_mask(df, axis=1, mask=None, normalize=False)
+    res2 = jutil.rank_with_mask(df, axis=1, mask=None, normalize=True)
+    print
+    
+    #assert np.nanmean(val[res == 1].values.flatten()) < 0.11
+    #
+    #val = pd.DataFrame(np.random.rand(1000, 100))
+    #expr = parser.parse('Ts_Quantile(val, 500, 12)')
+    #res = parser.evaluate({'val': val})
+    #assert np.nanmean(val[res == 1].values.flatten()) < 0.11
+
+
 def test_io():
     folder_relative = '../output/test/test_file_io'
     folder = jutil.join_relative_path(folder_relative)
@@ -124,6 +138,27 @@ def test_base64():
     plt.plot(range(10))
     res = jutil.fig2base64(fig, 'png')
     res = jutil.fig2base64(fig, 'pdf')
+
+
+def test_is_numeric():
+    from jaqs.util import is_numeric
+    
+    NUMERIC = [True, 1, -1, 1.0, 1+1j]
+    NOT_NUMERIC = [object(), 'string', u'unicode', None]
+    
+    def test_is_numeric(self):
+        for x in self.NUMERIC:
+            for y in (x, [x], [x] * 2):
+                for z in (y, np.array(y)):
+                    self.assertTrue(is_numeric(z))
+        for x in self.NOT_NUMERIC:
+            for y in (x, [x], [x] * 2):
+                for z in (y, np.array(y)):
+                    self.assertFalse(is_numeric(z))
+        for kind, dtypes in np.sctypes.items():
+            if kind != 'others':
+                for dtype in dtypes:
+                    self.assertTrue(is_numeric(np.array([0], dtype=dtype)))
 
 
 if __name__ == "__main__":

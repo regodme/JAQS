@@ -1,10 +1,16 @@
 # encoding: utf-8
+"""
+Function align is used by DataView, to expand and re-arrange data in a DataFrame
+according to their available time, which is stored in another DataFrame.
+
+"""
 from __future__ import print_function
 import numpy as np
 import pandas as pd
+from jaqs.util import is_numeric
 
 
-def get_neareast(df_ann, df_value, date):
+def _get_neareast(df_ann, df_value, date):
     """
     Get the value whose ann_date is earlier and nearest to date.
     
@@ -27,6 +33,8 @@ def get_neareast(df_ann, df_value, date):
     df_ann.fillna(99999999, inplace=True)  # IMPORTANT: At cells where no quarterly data is available,
                                            # we know nothing, thus it will be filled nan in the next step
     """
+    if is_numeric(df_value):
+        df_value = df_value.astype(float)
     mask = date[0] >= df_ann
     # res = np.where(mask, df_value, np.nan)
     n = df_value.shape[1]
@@ -65,7 +73,7 @@ def align(df_value, df_ann, date_arr):
     
     date_arr = np.asarray(date_arr, dtype=int)
     
-    res = np.apply_along_axis(lambda date: get_neareast(df_ann.values, df_value.values, date), 1, date_arr.reshape(-1, 1))
+    res = np.apply_along_axis(lambda date: _get_neareast(df_ann.values, df_value.values, date), 1, date_arr.reshape(-1, 1))
 
     df_res = pd.DataFrame(index=date_arr, columns=df_value.columns, data=res)
     return df_res
