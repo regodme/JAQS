@@ -1,11 +1,11 @@
 # encoding: utf-8
 
 from __future__ import unicode_literals
-from builtins import str
 try:
     basestring
 except NameError:
     basestring = str
+from collections import defaultdict
 
 import numpy as np
 import pandas as pd
@@ -68,6 +68,7 @@ class Context(object):
         self.snapshot = None
         
         self.storage = dict()
+        self.records = defaultdict(list)
         
         for member, obj in self.__dict__.items():
             if hasattr(obj, 'ctx'):
@@ -83,7 +84,16 @@ class Context(object):
         s = jutil.load_pickle(path)
         if s is not None:
             self.storage = s
-            
+    
+    def record(self, key, value):
+        self.records[key].append((self.trade_date, self.time, value))
+    
+    def get_records(self):
+        dic_df = dict()
+        for key, list_of_entries in self.records.items():
+            dic_df = pd.DataFrame(list_of_entries, columns=['trade_date', 'time', key])
+        return dic_df
+	
     '''
     @property
     def calendar(self):
@@ -137,7 +147,7 @@ class Context(object):
             value.register_context(self)
         self._dataview = value
         
-    def init_universe(self, univ):
+    def init_universe(self, symbols):
         """
         univ could be single symbol or securities separated by ,
         
@@ -146,14 +156,14 @@ class Context(object):
         univ : str or list
         
         """
-        if isinstance(univ, list):
-            self.universe = univ
-        elif isinstance(univ, basestring):
-            l = univ.split(',')
+        if isinstance(symbols, list):
+            self.universe = symbols
+        elif isinstance(symbols, basestring):
+            l = symbols.split(',')
             l = [x for x in l if x]
             self.universe = l
         else:
-            raise NotImplementedError("type of univ is {}".format(type(univ)))
+            raise NotImplementedError("type of univ is {}".format(type(symbols)))
 
 
 class AlphaContext(Context):

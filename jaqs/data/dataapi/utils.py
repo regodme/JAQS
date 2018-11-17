@@ -3,7 +3,10 @@ from __future__ import division
 from __future__ import print_function
 from __future__ import unicode_literals
 
-from builtins import *
+try:
+    basestring
+except NameError:
+    basestring = str
 from collections import namedtuple
 import datetime  as dt
 import pandas    as pd
@@ -80,10 +83,9 @@ def to_obj(class_name, data):
 
 
 def to_date_int(date):
-    if isinstance(date, str):
-        t = dt.datetime.strptime(date, "%Y-%m-%d")
-        date_int = t.year * 10000 + t.month * 100 + t.day
-        return date_int
+    if isinstance(date, basestring):
+        tmp = date.replace('-','')
+        return int(tmp)
     elif isinstance(date, (int, np.integer)):
         return date
     else:
@@ -91,10 +93,15 @@ def to_date_int(date):
 
 
 def to_time_int(time):
-    if isinstance(time, str):
-        t = dt.datetime.strptime(time, "%H:%M:%S")
-        time_int = t.hour * 10000 + t.minute * 100 + t.second
-        return time_int
+    if isinstance(time, basestring):
+        if ':' in time:
+            tmp = time.replace(':','')
+            return int(tmp)
+        else:
+            t = dt.datetime.strptime(time, "%H:%M:%S")
+            time_int = t.hour * 10000 + t.minute * 100 + t.second
+            return time_int
+
     elif isinstance(time, (int, np.integer)):
         return time
     else:

@@ -1,21 +1,17 @@
 # encoding: UTF-8
 
-from __future__ import print_function
-from abc import abstractmethod
-import abc
-from six import with_metaclass
+from __future__ import print_function, unicode_literals
+
 import copy
 import time
-from collections import defaultdict
 
 import numpy as np
 
 from jaqs.data.basic import *
+from jaqs.data.basic import OrderStatusInd, Trade, TaskInd, Task
+from jaqs.trade.tradeapi import TradeApi
 from jaqs.util.sequence import SequenceGenerator
 import jaqs.util as jutil
-from jaqs.trade.event import EVENT_TYPE, EventEngine, Event
-from jaqs.trade.tradeapi import TradeApi
-from jaqs.data.basic import OrderStatusInd, Trade, TaskInd, Task
 
 
 '''
@@ -33,6 +29,12 @@ class TradeCallback(with_metaclass(abc.ABCMeta)):
         pass
 
 '''
+
+
+def calc_commission(trade_ind, commission_rate):
+    turnover = abs(trade_ind.fill_price * trade_ind.fill_size)
+    res = turnover * commission_rate
+    return res
 
 
 class BaseTradeApi(object):
@@ -498,10 +500,10 @@ class RealTimeTradeApi_async(BaseTradeApi, EventEngine):
 
 
 class RealTimeTradeApi(TradeApi):
-    def __init__(self, props):
+    def __init__(self, props, **trade_api_kwargs):
         address = props['remote.trade.address']
         
-        super(RealTimeTradeApi, self).__init__(address)
+        super(RealTimeTradeApi, self).__init__(address, **trade_api_kwargs)
         
         self.ctx = None
         self.user_info = dict()
@@ -534,16 +536,15 @@ class RealTimeTradeApi(TradeApi):
         if not (msg == '0,'):
             print("    login failed: msg = '{}'\n".format(msg))
         else:
-            print("    login success. user info: \n"
-                  "    {:s}\n".format(str(user_info)))
+            print("    login success. user info: \n", repr(user_info), "\n")
             
         self.user_info = user_info
         
         strategy_no = get_from_list_of_dict(dic_list, "strategy_no", 0)
         sid, msg = self.use_strategy(strategy_no)
         if not msg.split(',')[0] == '0':
-            print(msg)
-            raise RuntimeError("use strategy failed. Please re-try.")
+            raise RuntimeError("use strategy failed. Error msg: {}\n"
+                               "Please re-try.".format(msg))
         time.sleep(0.1)
     
     def set_trade_api_callbacks(self):
@@ -715,8 +716,8 @@ class AlphaTradeApi(BaseTradeApi):
     def goal_portfolio(self, positions, algo="", algo_param={}, userdata=""):
         # Generate Orders
         task_id = self._get_next_task_id()
-        
-        orders = []
+
+        orders = {}
         for goal in positions:
             sec, goal_size = goal['symbol'], goal['size']
             if sec in self.ctx.pm.holding_securities:
@@ -730,29 +731,32 @@ class AlphaTradeApi(BaseTradeApi):
                 order = FixedPriceTypeOrder.new_order(sec, action, 0.0, abs(diff_size), self.ctx.trade_date, 0)
                 if algo == 'vwap':
                     order.price_target = 'vwap'  # TODO
+                elif algo.startswith('limit:'):
+                    order.price_target = algo.split(':')[1].strip()
                 elif algo == '':
                     order.price_target = 'vwap'
                 else:
                     raise NotImplementedError("goal_portfolio algo = {}".format(algo))
 
                 order.task_id = task_id
-                orders.append(order)
+                order.entrust_no = self._simulator.add_order(order)
+                orders[order.entrust_no] = order
 
         # Generate Task
         task = Task(task_id,
                     algo=algo, algo_param=algo_param, data=orders,
                     function_name='goal_portfolio', trade_date=self.ctx.trade_date)
 
+
         self.ctx.pm.add_task(task)
 
         # Send Orders to Exchange
-        for order in orders:
-            entrust_no = self._simulator.add_order(order)
-            # task.data.entrust_no = entrust_no
+        for entrust_no, order in orders.items():
             self.entrust_no_task_id_map[entrust_no] = task.task_id
-            
+
             order_status_ind = OrderStatusInd(order)
             order_status_ind.order_status = common.ORDER_STATUS.ACCEPTED
+
             self._order_status_callback(order_status_ind)
     
     def goal_portfolio_by_batch_order(self, goals):
@@ -801,33 +805,29 @@ class AlphaTradeApi(BaseTradeApi):
         return self._simulator.match(price_dict, date=self.ctx.trade_date, time=time)
 
     '''
-    def calc_commission(self, trade_ind):
-        to = abs(trade_ind.fill_price * trade_ind.fill_size)
-        res = to * self.commission_rate
-        return res
-
     def _add_commission(self, ind):
-        comm = self.calc_commission(ind)
+        comm = calc_commission(ind, self.commission_rate)
         ind.commission = comm
         
     def match_and_callback(self, price_dict):
         results = self._simulator.match(price_dict, date=self.ctx.trade_date, time=self.MATCH_TIME)
-    
+
         for trade_ind, order_status_ind in results:
             self._add_commission(trade_ind)
         
             task_id = self.entrust_no_task_id_map[trade_ind.entrust_no]
             self._add_task_id(trade_ind)
             self._add_task_id(order_status_ind)
-        
+
             self._order_status_callback(order_status_ind)
             self._trade_callback(trade_ind)
-        
+
             task = self.ctx.pm.get_task(task_id)
             if task.is_finished:
                 task_ind = TaskInd(task_id, task_status=task.task_status,
                                    task_algo='', task_msg="")
                 self._task_status_callback(task_ind)
+
         return results
 
 
@@ -958,7 +958,8 @@ class DailyStockSimulator(object):
             trade_ind = Trade(order)
             trade_ind.set_fill_info(fill_price, fill_size,
                                     date, time,
-                                    self._next_fill_no())
+                                    self._next_fill_no(),
+                                    trade_date=date)
             
             # update order status
             order.fill_price = (order.fill_price * order.fill_size
@@ -1029,7 +1030,8 @@ class OrderBook(object):
             quote = quote_dic[order.symbol]
             low = quote.low
             high = quote.high
-            quote_date = quote.trade_date
+            #quote_date = quote.trade_date
+            quote_date = quote.date
             quote_time = quote.time
             volume = quote.volume
             
@@ -1131,9 +1133,10 @@ class OrderBook(object):
                 continue
                 
             trade_ind = Trade(order)
-            trade_ind.set_fill_info(order.entrust_price, order.entrust_size,
+            trade_ind.set_fill_info(fill_price, fill_size,
                                     quote_date, quote_time,
-                                    self._next_fill_no())
+                                    self._next_fill_no(),
+                                    trade_date=quote.trade_date)
             
             order.fill_price = ((order.fill_price * order.fill_size + fill_size * fill_price)
                                 / (order.fill_size + fill_size))
@@ -1274,23 +1277,24 @@ class BacktestTradeApi(BaseTradeApi):
         task = self.ctx.pm.get_task(task_id)
         if task.function_name == 'place_order':
             order = task.data
-            entrust_no = order.entrust_no
-            order_status_ind = self._orderbook.cancel_order(entrust_no)
-            task_id = self.entrust_no_task_id_map[entrust_no]
-            order_status_ind.task_id = task_id
-            # order_status_ind.task_no = task_id
-            self._order_status_callback(order_status_ind)
+            if order.order_status in [common.ORDER_STATUS.NEW, common.ORDER_STATUS.ACCEPTED]:
+                entrust_no = order.entrust_no
+                order_status_ind = self._orderbook.cancel_order(entrust_no)
+                task_id = self.entrust_no_task_id_map[entrust_no]
+                order_status_ind.task_id = task_id
+                # order_status_ind.task_no = task_id
+                self._order_status_callback(order_status_ind)
+            else:
+                order_status_ind = OrderStatusInd(order)
+                order_status_ind.task_id = task_id
+                self._order_status_callback(order_status_ind)
+
         else:
             raise NotImplementedError("cancel task with function_name = {}".format(task.function_name))
     
     def _process_quote(self, df_quote, freq):
         return self._orderbook.make_trade(df_quote, freq)
 
-    def calc_commission(self, trade_ind):
-        to = abs(trade_ind.fill_price * trade_ind.fill_size)
-        res = to * self.commission_rate
-        return res
-    
     def _add_task_id(self, ind):
         no = ind.entrust_no
         task_id = self.entrust_no_task_id_map[no]
@@ -1298,7 +1302,7 @@ class BacktestTradeApi(BaseTradeApi):
         # ind.task_no = task_id
     
     def _add_commission(self, ind):
-        comm = self.calc_commission(ind)
+        comm = calc_commission(ind, self.commission_rate)
         ind.commission = comm
         
     def match_and_callback(self, quote, freq):
@@ -1319,4 +1323,6 @@ class BacktestTradeApi(BaseTradeApi):
                 task_ind = TaskInd(task_id, task_status=task.task_status,
                                    task_algo='', task_msg="")
                 self._task_status_callback(task_ind)
+        
+        return results
 

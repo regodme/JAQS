@@ -24,7 +24,7 @@ def test_write():
 
     dv.init_from_config(props, data_api=ds)
     dv.prepare_data()
-    assert dv.data_d.shape == (281, 48)
+    assert dv.data_d.shape == (281, 54)
     assert dv.dates.shape == (281, )
     # TODO
     """
@@ -139,7 +139,6 @@ def test_dataview_universe():
         pass
     
     dv.remove_field('roe,net_assets')
-    dv.remove_field(['roe', 'net_assets'])
     dv.remove_field('close')
 
 

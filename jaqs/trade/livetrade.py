@@ -74,10 +74,12 @@ class AlphaLiveTradeInstance(object):
         if self.ctx.dataview.universe:
             
             # we are able to know information about index component before market open
-            col = 'index_member'
-            df_is_member = self.ctx.dataview.get_snapshot(self.ctx.trade_date, fields=col)
-            df_is_member = df_is_member.fillna(0).astype(bool)
-            dic_index_member = df_is_member.loc[:, col].to_dict()
+            #col = 'index_member'
+            #df_is_member = self.ctx.dataview.get_snapshot(self.ctx.trade_date, fields=col)
+            #df_is_member = df_is_member.fillna(0).astype(bool)
+            #dic_index_member = df_is_member.loc[:, col].to_dict()
+            ser_is_member = self.ctx.dataview.get_ts('index_member').iloc[-1, :]
+            dic_index_member = ser_is_member.to_dict()
             universe_list = [symbol for symbol, value in dic_index_member.items() if value]
         
         # Step.2 filter out those not listed or already de-listed
@@ -210,7 +212,7 @@ class AlphaLiveTradeInstance(object):
             mask = dates > date
             return dates[mask][0]
         else:
-            return self.ctx.data_api.get_next_trade_date(date)
+            return self.ctx.data_api.query_next_trade_date(date)
     
     def _get_last_trade_date(self, date):
         if self.ctx.dataview is not None:
@@ -218,7 +220,7 @@ class AlphaLiveTradeInstance(object):
             mask = dates < date
             return dates[mask][-1]
         else:
-            return self.ctx.data_api.get_last_trade_date(date)
+            return self.ctx.data_api.query_last_trade_date(date)
     
     '''
     def on_new_day(self, date):

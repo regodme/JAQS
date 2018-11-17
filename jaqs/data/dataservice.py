@@ -1,10 +1,23 @@
 # encoding: UTF-8
+"""
+Module dataservice defines DataService and RemoteDataService.
+
+DataService is just an interface. RemoteDataService is a wrapper class for DataApi.
+It inherits all methods of DataApi and implements several convenient methods making
+query data more natural and easy.
+
+"""
 
 from __future__ import print_function
 from __future__ import unicode_literals
-from builtins import *
+from builtins import str
 from abc import abstractmethod
 from six import with_metaclass
+
+try:
+    basestring
+except NameError:
+    basestring = str
 
 import numpy as np
 import pandas as pd
@@ -31,6 +44,14 @@ class QueryDataError(Exception):
 
 
 class Singleton(type):
+    """
+    Metaclass that can make a class to be singleton.
+    
+    Usage:
+        class Foo(with_metaclass(Singleton, OtherMetaClass)):
+            pass
+        
+    """
     _instances = {}
     
     def __call__(cls, *args, **kwargs):
@@ -41,61 +62,30 @@ class Singleton(type):
 
 class DataService(object):
     """
-    Abstract base class providing both historic and live data
+    DataService is an abstract base class providing both historic and live data
     from various data sources.
-    Current API version: 1.8
 
-    Derived classes of DataServer hide different data source, but use the same API.
+    Derived classes of DataService may use different data source, but use the same API.
 
     Attributes
     ----------
-    source_name : str
-        Name of data source.
+    ctx : Context
+        Running context.
 
     Methods
     -------
-    subscribe
-    quote
     daily
+    quote
     bar
-    tick
+    bar_quote
     query
+    subscribe
 
     """
-    def __init__(self, name=""):
-        
-        if name:
-            self.source_name = name
-        else:
-            self.source_name = str(self.__class__.__name__)
-        
+
+    def __init__(self):
         self.ctx = None
     
-    '''
-    def subscribe(self, targets, callback):
-        """
-        Subscribe real time market data, including bar and tick,
-        processed by respective callback function.
-
-        Parameters
-        ----------
-        targets : str
-            Security and type, eg. "000001.SH/tick,cu1709.SHF/1m"
-        callback : dict of {str: callable}
-            {'on_tick': func1, 'on_bar': func2}
-            Call back functions.
-
-        """
-        # TODO for now it will not publish event
-        for target in targets.split(','):
-            sec, data_type = target.split('/')
-            if data_type == 'tick':
-                func = callback['on_tick']
-            else:
-                func = callback['on_bar']
-            self.add_subscriber(func, target)
-    
-    '''
     def register_context(self, context):
         self.ctx = context
     
@@ -122,6 +112,38 @@ class DataService(object):
     @abstractmethod
     def bar_quote(self, symbol, start_time=200000, end_time=160000,
                   trade_date=0, freq="1M", fields="", data_format="", **kwargs):
+        """
+        Query minute bars with latest quote, return DataFrame.
+
+        Parameters
+        ----------
+        symbol : str
+            support multiple securities, separated by comma.
+        start_time : int (HHMMSS) or str ('HH:MM:SS')
+            Default is market open time.
+        end_time : int (HHMMSS) or str ('HH:MM:SS')
+            Default is market close time.
+        trade_date : int (YYYMMDD) or str ('YYYY-MM-DD')
+            Default is current trade_date.
+        fields : str, optional
+            separated by comma ',', default "" (all fields included).
+        freq : trade.common.MINBAR_TYPE, optional
+            {'1m', '5m', '15m'}, Minute bar type, default is '1m'
+
+        Returns
+        -------
+        df : pd.DataFrame
+            columns:
+                symbol, code, date, time, trade_date, freq, open, high, low, close, volume, turnover, vwap, oi
+        err_msg : str
+            error code and error message joined by comma
+
+        Examples
+        --------
+        df, err_msg = api.bar("000001.SH,cu1709.SHF", start_time="09:56:00", end_time="13:56:00",
+                          trade_date="20170823", fields="open,high,low,last,volume", freq="5m")
+
+        """
         pass
         
     @abstractmethod
@@ -200,32 +222,6 @@ class DataService(object):
         pass
     
     @abstractmethod
-    def tick(self, symbol, start_time=200000, end_time=160000, trade_date=None, fields=""):
-        """
-        Query tick data in DataFrame.
-        
-        Parameters
-        ----------
-        symbol : str
-        start_time : int (HHMMSS) or str ('HH:MM:SS')
-            Default is market open time.
-        end_time : int (HHMMSS) or str ('HH:MM:SS')
-            Default is market close time.
-        trade_date : int (YYYMMDD) or str ('YYYY-MM-DD')
-            Default is current trade_date.
-        fields : str, optional
-            separated by comma ',', default "" (all fields included).
-
-        Returns
-        -------
-        df : pd.DataFrame
-        err_msg : str
-            error code and error message joined by comma
-            
-        """
-        pass
-    
-    @abstractmethod
     def query(self, view, filter, fields):
         """
         Query reference data.
@@ -249,13 +245,6 @@ class DataService(object):
         """
         pass
     
-    @abstractmethod
-    def get_split_dividend(self):
-        pass
-    
-    def get_suspensions(self):
-        pass
-
 
 class RemoteDataService(with_metaclass(Singleton, DataService)):
     """
@@ -263,6 +252,7 @@ class RemoteDataService(with_metaclass(Singleton, DataService)):
     It wraps DataApi and simplify usage.
 
     """
+
     def __init__(self):
         # print("Init RemoteDataService DEBUG")
         super(RemoteDataService, self).__init__()
@@ -273,6 +263,7 @@ class RemoteDataService(with_metaclass(Singleton, DataService)):
         self._username = ""
         self._password = ""
         self._timeout = 60
+        self._trade_dates_df = None
         
         self._REPORT_DATE_FIELD_NAME = 'report_date'
         
@@ -281,6 +272,7 @@ class RemoteDataService(with_metaclass(Singleton, DataService)):
         self.data_api.close()
 
     '''
+
     def init_from_config(self, props):
         """
         
@@ -296,6 +288,7 @@ class RemoteDataService(with_metaclass(Singleton, DataService)):
         "remote.data.password": "your password"}
 
         """
+
         def get_from_list_of_dict(l, key, default=None):
             res = None
             for dic in l:
@@ -342,11 +335,17 @@ class RemoteDataService(with_metaclass(Singleton, DataService)):
             self.data_api = data_api
             print(INDENT + "login success \n")
         
+        trade_dates_df, err_msg1 = self.query("jz.secTradeCal", fields="trade_date", filter="", orderby="")
+        if not trade_dates_df.empty:
+            self._trade_dates_df = trade_dates_df
+        else:
+            print("No trade date.\n".format(err_msg1))
+
         return err_msg
         
     @property
     def data_api_loginned(self):
-        return (self.data_api is not None) and (self.data_api._loggined)
+        return (self.data_api is not None) and (self.data_api._loggined) and (self.data_api._connected)
     
     def _raise_error_if_no_data_api(self):
         if not self.data_api_loginned:
@@ -362,6 +361,40 @@ class RemoteDataService(with_metaclass(Singleton, DataService)):
     # Basic APIs
     def daily(self, symbol, start_date, end_date,
               fields="", adjust_mode=None):
+        """
+        Query dar bar,
+        support auto-fill suspended securities data,
+        support auto-adjust for splits, dividends and distributions.
+
+        Parameters
+        ----------
+        symbol : str
+            support multiple securities, separated by comma.
+        start_date : int or str
+            YYYMMDD or 'YYYY-MM-DD'
+        end_date : int or str
+            YYYMMDD or 'YYYY-MM-DD'
+        fields : str, optional
+            separated by comma ',', default "" (all fields included).
+        adjust_mode : str or None, optional
+            None for no adjust;
+            'pre' for forward adjust;
+            'post' for backward adjust.
+
+        Returns
+        -------
+        df : pd.DataFrame
+            columns:
+                symbol, code, trade_date, open, high, low, close, volume, turnover, vwap, oi, suspended
+        err_msg : str
+            error code and error message joined by comma
+
+        Examples
+        --------
+        df, err_msg = api.daily("00001.SH,cu1709.SHF",start_date=20170503, end_date=20170708,
+                            fields="open,high,low,last,volume", fq=None, skip_suspended=True)
+
+        """
         self._raise_error_if_no_data_api()
         
         df, err_msg = self.data_api.daily(symbol=symbol, start_date=start_date, end_date=end_date,
@@ -376,6 +409,38 @@ class RemoteDataService(with_metaclass(Singleton, DataService)):
     def bar(self, symbol,
             start_time=200000, end_time=160000, trade_date=None,
             freq='1M', fields=""):
+        """
+        Query minute bars of various type, return DataFrame.
+
+        Parameters
+        ----------
+        symbol : str
+            support multiple securities, separated by comma.
+        start_time : int (HHMMSS) or str ('HH:MM:SS')
+            Default is market open time.
+        end_time : int (HHMMSS) or str ('HH:MM:SS')
+            Default is market close time.
+        trade_date : int (YYYMMDD) or str ('YYYY-MM-DD')
+            Default is current trade_date.
+        fields : str, optional
+            separated by comma ',', default "" (all fields included).
+        freq : trade.common.MINBAR_TYPE, optional
+            {'1m', '5m', '15m'}, Minute bar type, default is '1m'
+
+        Returns
+        -------
+        df : pd.DataFrame
+            columns:
+                symbol, code, date, time, trade_date, freq, open, high, low, close, volume, turnover, vwap, oi
+        err_msg : str
+            error code and error message joined by comma
+
+        Examples
+        --------
+        df, err_msg = api.bar("000001.SH,cu1709.SHF", start_time="09:56:00", end_time="13:56:00",
+                          trade_date="20170823", fields="open,high,low,last,volume", freq="5m")
+
+        """
         self._raise_error_if_no_data_api()
         
         df, err_msg = self.data_api.bar(symbol=symbol, fields=fields,
@@ -386,6 +451,22 @@ class RemoteDataService(with_metaclass(Singleton, DataService)):
         return df, err_msg
     
     def quote(self, symbol, fields=""):
+        """
+        Query latest market data in DataFrame.
+        
+        Parameters
+        ----------
+        symbol : str
+        fields : str, optional
+            default ""
+
+        Returns
+        -------
+        df : pd.DataFrame
+        err_msg : str
+            error code and error message joined by comma
+
+        """
         self._raise_error_if_no_data_api()
         
         df, err_msg = self.data_api.quote(symbol=symbol, fields=fields)
@@ -396,6 +477,38 @@ class RemoteDataService(with_metaclass(Singleton, DataService)):
     
     def bar_quote(self, symbol, start_time=200000, end_time=160000,
                   trade_date=0, freq="1M", fields="", data_format="", **kwargs):
+        """
+        Query minute bars with latest quote, return DataFrame.
+
+        Parameters
+        ----------
+        symbol : str
+            support multiple securities, separated by comma.
+        start_time : int (HHMMSS) or str ('HH:MM:SS')
+            Default is market open time.
+        end_time : int (HHMMSS) or str ('HH:MM:SS')
+            Default is market close time.
+        trade_date : int (YYYMMDD) or str ('YYYY-MM-DD')
+            Default is current trade_date.
+        fields : str, optional
+            separated by comma ',', default "" (all fields included).
+        freq : trade.common.MINBAR_TYPE, optional
+            {'1m', '5m', '15m'}, Minute bar type, default is '1m'
+
+        Returns
+        -------
+        df : pd.DataFrame
+            columns:
+                symbol, code, date, time, trade_date, freq, open, high, low, close, volume, turnover, vwap, oi
+        err_msg : str
+            error code and error message joined by comma
+
+        Examples
+        --------
+        df, err_msg = api.bar("000001.SH,cu1709.SHF", start_time="09:56:00", end_time="13:56:00",
+                          trade_date="20170823", fields="open,high,low,last,volume", freq="5m")
+
+        """
         self._raise_error_if_no_data_api()
 
         df, err_msg = self.data_api.bar_quote(symbol=symbol, start_time=start_time, end_time=end_time,
@@ -410,11 +523,11 @@ class RemoteDataService(with_metaclass(Singleton, DataService)):
         
         Parameters
         ----------
-        view : str
+        view : str or unicode
             data source.
-        fields : str
+        fields : str or unicode
             Separated by ','
-        filter : str
+        filter : str or unicode
             filter expressions.
         kwargs
 
@@ -435,7 +548,7 @@ class RemoteDataService(with_metaclass(Singleton, DataService)):
         """
         self._raise_error_if_no_data_api()
         
-        df, err_msg = self.data_api.query(view, fields=fields, filter=filter, data_format="", **kwargs)
+        df, err_msg = self.data_api.query(view, fields=fields, filter=filter, **kwargs)
         
         self._raise_error_if_msg(err_msg)
         return df, err_msg
@@ -552,7 +665,7 @@ class RemoteDataService(with_metaclass(Singleton, DataService)):
         self._raise_error_if_msg(err_msg)
         return res, err_msg
 
-    def get_index_weights(self, index, trade_date):
+    def query_index_weights_raw(self, index, trade_date):
         """
         Return all securities that have been in index during start_date and end_date.
         
@@ -581,7 +694,7 @@ class RemoteDataService(with_metaclass(Singleton, DataService)):
         df_io.loc[:, 'weight'] = df_io['weight'] / 100.
         return df_io
 
-    def get_index_weights_range(self, index, start_date, end_date):
+    def query_index_weights_range(self, index, start_date, end_date):
         """
         Return all securities that have been in index during start_date and end_date.
         
@@ -614,50 +727,7 @@ class RemoteDataService(with_metaclass(Singleton, DataService)):
         df_io = df_io.fillna(0.0)
         return df_io
 
-    '''
-    def get_index_weights_daily_OLD(self, index, start_date, end_date):
-        """
-        Return all securities that have been in index during start_date and end_date.
-        
-        Parameters
-        ----------
-        index : str
-        start_date : int
-        end_date : int
-
-        Returns
-        -------
-        res : pd.DataFrame
-            Index is trade_date, columns are symbols.
-
-        """
-        # TODO: temparary api
-        trade_dates = self.get_trade_date_range(start_date, end_date)
-        start_date, end_date = trade_dates[0], trade_dates[-1]
-        td = start_date
-        
-        dic = dict()
-        symbols_set = set()
-        while True:
-            if td > end_date:
-                break
-            df = self.get_index_weights(index, td)
-            # update_date = df['trade_date'].iat[0]
-            # if update_date >= start_date and update_date <= end_date:
-            symbols_set.update(set(df.index))
-            dic[td] = df['weight']
-            
-            td = jutil.get_next_period_day(td, 'month', 1)
-        merge = pd.concat(dic, axis=1).T
-        merge = merge.fillna(0.0)  # for those which are not components
-        res = pd.DataFrame(index=trade_dates, columns=sorted(list(symbols_set)), data=np.nan)
-        res.update(merge)
-        res = res.fillna(method='ffill')
-        res = res.loc[start_date: end_date]
-        return res
-
-    '''
-    def get_index_weights_daily(self, index, start_date, end_date):
+    def query_index_weights_daily(self, index, start_date, end_date):
         """
         Return all securities that have been in index during start_date and end_date.
         
@@ -677,9 +747,9 @@ class RemoteDataService(with_metaclass(Singleton, DataService)):
         start_dt = jutil.convert_int_to_datetime(start_date)
         start_dt_extended = start_dt - pd.Timedelta(days=45)
         start_date_extended = jutil.convert_datetime_to_int(start_dt_extended)
-        trade_dates = self.get_trade_date_range(start_date_extended, end_date)
+        trade_dates = self.query_trade_dates(start_date_extended, end_date)
         
-        df_weight_raw = self.get_index_weights_range(index, start_date=start_date_extended, end_date=end_date)
+        df_weight_raw = self.query_index_weights_range(index, start_date=start_date_extended, end_date=end_date)
         res = df_weight_raw.reindex(index=trade_dates)
         res = res.fillna(method='ffill')
         res = res.loc[res.index >= start_date]
@@ -715,7 +785,7 @@ class RemoteDataService(with_metaclass(Singleton, DataService)):
         self._raise_error_if_msg(err_msg)
         return df_io, err_msg
     
-    def get_index_comp(self, index, start_date, end_date):
+    def query_index_member(self, index, start_date, end_date):
         """
         Return list of symbols that have been in index during start_date and end_date.
         
@@ -734,7 +804,7 @@ class RemoteDataService(with_metaclass(Singleton, DataService)):
         df_io, err_msg = self._get_index_comp(index, start_date, end_date)
         return list(np.unique(df_io.loc[:, 'symbol']))
     
-    def get_index_comp_df(self, index, start_date, end_date):
+    def query_index_member_daily(self, index, start_date, end_date):
         """
         Get index components on each day during start_date and end_date.
         
@@ -757,17 +827,18 @@ class RemoteDataService(with_metaclass(Singleton, DataService)):
             print(err_msg)
         
         def str2int(s):
-            if isinstance(s, str):
+            if isinstance(s, basestring):
                 return int(s) if s else 99999999
             elif isinstance(s, (int, np.integer, float, np.float)):
                 return s
             else:
                 raise NotImplementedError("type s = {}".format(type(s)))
+
         df_io.loc[:, 'in_date'] = df_io.loc[:, 'in_date'].apply(str2int)
         df_io.loc[:, 'out_date'] = df_io.loc[:, 'out_date'].apply(str2int)
         
         # df_io.set_index('symbol', inplace=True)
-        dates = self.get_trade_date_range(start_date=start_date, end_date=end_date)
+        dates = self.query_trade_dates(start_date=start_date, end_date=end_date)
 
         dic = dict()
         gp = df_io.groupby(by='symbol')
@@ -779,10 +850,171 @@ class RemoteDataService(with_metaclass(Singleton, DataService)):
             dic[sec] = mask
             
         res = pd.DataFrame(index=dates, data=dic)
+        res.index.name = 'trade_date'
         
         return res
 
-    def get_industry_daily(self, symbol, start_date, end_date, type_='SW', level=1):
+    def _get_universe_comp(self, universe, start_date, end_date):
+        """
+        Return all securities that have been in index during start_date and end_date.
+
+        Parameters
+        ----------
+        universe : str
+            separated by ','
+        start_date : int
+        end_date : int
+
+        Returns
+        -------
+        list
+
+        """
+        # Remove mkt suffix
+
+        filter_argument = self._dic2url({'univ_id'   : universe,
+                                         'start_date': start_date,
+                                         'end_date'  : end_date})
+
+        df_io, err_msg = self.query("jz.univMember", fields="",
+                                    filter=filter_argument, orderby="univ_member")
+        self._raise_error_if_msg(err_msg)
+
+        return df_io, err_msg
+
+    def query_universe_member(self, universe, start_date, end_date):
+        """
+        Return list of symbols that have been in index during start_date and end_date.
+
+        Parameters
+        ----------
+        index : str
+            separated by ','
+        start_date : int
+        end_date : int
+
+        Returns
+        -------
+        list
+
+        """
+        df_io, err_msg = self._get_universe_comp(universe, start_date, end_date)
+        return list(np.unique(df_io.loc[:, 'univ_member']))
+
+    def query_universe_member_daily(self, universe, start_date, end_date):
+        """
+        Get universe's members on each day during start_date and end_date.
+
+        Parameters
+        ----------
+        universe : str
+        start_date : int
+        end_date : int
+
+        Returns
+        -------
+        res : pd.DataFrame
+            index dates, columns all securities that have ever been components,
+            values are 0 (not in) or 1 (in)
+
+        """
+        df_io, err_msg = self._get_universe_comp(universe, start_date, end_date)
+        if err_msg != '0,':
+            print(err_msg)
+
+        def str2int(s):
+            if isinstance(s, basestring):
+                return int(s) if s else 99999999
+            elif isinstance(s, (int, np.integer, float, np.float)):
+                return s
+            else:
+                raise NotImplementedError("type s = {}".format(type(s)))
+
+        # df_io.loc[:, 'in_date'] = df_io.loc[:, 'in_date'].apply(str2int)
+        # df_io.loc[:, 'out_date'] = df_io.loc[:, 'out_date'].apply(str2int)
+
+        # df_io.set_index('symbol', inplace=True)
+        dates = self.query_trade_dates(start_date=start_date, end_date=end_date)
+        dates = pd.Series(dates)
+
+        df_io = df_io.rename(columns={'univ_weight': 'weight', 'univ_member':'symbol'})
+        df_io = df_io[['trade_date', 'symbol','weight']]
+
+        dic = dict()
+        gp = df_io.groupby(by='symbol')
+        for sec, df in gp:
+            mask = np.zeros_like(dates, dtype=np.integer)
+            for idx, row in df.iterrows():
+                bool_index = dates.isin(df['trade_date'])
+                mask[bool_index] = 1
+            dic[sec] = mask
+
+        res = pd.DataFrame(index=dates, data=dic)
+        res.index.name = 'trade_date'
+
+        return res
+
+    def query_universe_weights_range(self, universe, start_date, end_date):
+        """
+        Return all securities that have been in index during start_date and end_date.
+
+        Parameters
+        ----------
+        index : str
+            separated by ','
+        trade_date : int
+
+        Returns
+        -------
+        pd.DataFrame
+
+        """
+        df_io, msg = self._get_universe_comp(universe, start_date, end_date)
+        if msg != '0,':
+            print(msg)
+
+        df_io = df_io.rename(columns={'univ_weight': 'weight', 'univ_member':'symbol'})
+        df_io = df_io[['trade_date', 'symbol','weight']]
+        df_io = df_io.astype({'weight': float, 'trade_date': np.integer})
+        df_io.loc[:, 'weight'] = df_io['weight'] # / 100.
+        df_io = df_io.pivot(index='trade_date', columns='symbol', values='weight')
+        df_io = df_io.fillna(0.0)
+        return df_io
+
+    def query_universe_weights_daily(self, universe, start_date, end_date):
+        """
+        Return all securities that have been in index during start_date and end_date.
+
+        Parameters
+        ----------
+        universe : str
+        start_date : int
+        end_date : int
+
+        Returns
+        -------
+        res : pd.DataFrame
+            Index is trade_date, columns are symbols.
+
+        """
+
+        start_dt = jutil.convert_int_to_datetime(start_date)
+        start_dt_extended = start_dt - pd.Timedelta(days=45)
+        start_date_extended = jutil.convert_datetime_to_int(start_dt_extended)
+        trade_dates = self.query_trade_dates(start_date_extended, end_date)
+
+        df_weight_raw = self.query_universe_weights_range(universe, start_date=start_date_extended, end_date=end_date)
+        res = df_weight_raw.reindex(index=trade_dates)
+        res = res.fillna(method='ffill')
+        res = res.loc[res.index >= start_date]
+        res = res.loc[res.index <= end_date]
+
+        mask_col = res.sum(axis=0) > 0
+        res = res.loc[:, mask_col]
+
+        return res
+
+    def query_industry_daily(self, symbol, start_date, end_date, type_='SW', level=1):
         """
         Get index components on each day during start_date and end_date.
         
@@ -801,7 +1033,7 @@ class RemoteDataService(with_metaclass(Singleton, DataService)):
             values are industry code
 
         """
-        df_raw = self.get_industry_raw(symbol, type_=type_, level=level)
+        df_raw = self.query_industry_raw(symbol, type_=type_, level=level)
         
         dic_sec = jutil.group_df_to_dict(df_raw, by='symbol')
         dic_sec = {sec: df.sort_values(by='in_date', axis=0).reset_index()
@@ -819,7 +1051,7 @@ class RemoteDataService(with_metaclass(Singleton, DataService)):
         df_value = pd.DataFrame(index=idx, columns=symbol_arr, data=np.nan)
         df_value.loc[df_value_tmp.index, df_value_tmp.columns] = df_value_tmp
 
-        dates_arr = self.get_trade_date_range(start_date, end_date)
+        dates_arr = self.query_trade_dates(start_date, end_date)
         df_industry = align.align(df_value, df_ann, dates_arr)
         
         # TODO before industry classification is available, we assume they belong to their first group.
@@ -828,7 +1060,7 @@ class RemoteDataService(with_metaclass(Singleton, DataService)):
         
         return df_industry
         
-    def get_industry_raw(self, symbol, type_='ZZ', level=1):
+    def query_industry_raw(self, symbol, type_='ZZ', level=1):
         """
         Get daily industry of securities from ShenWanZhiShu or ZhongZhengZhiShu.
         
@@ -846,13 +1078,17 @@ class RemoteDataService(with_metaclass(Singleton, DataService)):
 
         """
         if type_ == 'SW':
-            src = '申万研究所'
+            src = 'sw'
             if level not in [1, 2, 3, 4]:
                 raise ValueError("For [SW], level must be one of {1, 2, 3, 4}")
         elif type_ == 'ZZ':
-            src = '中证指数有限公司'
-            if level not in [1, 2, 3, 4]:
+            src = 'zz'
+            if level not in [1, 2]:
                 raise ValueError("For [ZZ], level must be one of {1, 2}")
+        elif type_ == 'ZJH':
+            src = 'zjh'
+            if level not in [1, 2]:
+                raise ValueError("For [ZJH], level must be one of {1, 2}")
         else:
             raise ValueError("type_ must be one of SW of ZZ")
         
@@ -861,7 +1097,7 @@ class RemoteDataService(with_metaclass(Singleton, DataService)):
         fields_list = ['symbol', 'industry{:d}_code'.format(level), 'industry{:d}_name'.format(level)]
     
         df_raw, err_msg = self.query("lb.secIndustry", fields=','.join(fields_list),
-                                 filter=filter_argument, orderby="symbol")
+                                     filter=filter_argument, orderby="symbol")
         self._raise_error_if_msg(err_msg)
         
         df_raw = df_raw.astype(dtype={'in_date': np.integer,
@@ -869,7 +1105,7 @@ class RemoteDataService(with_metaclass(Singleton, DataService)):
                                      })
         return df_raw.drop_duplicates()
 
-    def get_adj_factor_daily(self, symbol, start_date, end_date, div=False):
+    def query_adj_factor_daily(self, symbol, start_date, end_date, div=False):
         """
         Get index components on each day during start_date and end_date.
         
@@ -889,7 +1125,7 @@ class RemoteDataService(with_metaclass(Singleton, DataService)):
             values are industry code
 
         """
-        df_raw = self.get_adj_factor_raw(symbol, start_date=start_date, end_date=end_date)
+        df_raw = self.query_adj_factor_raw(symbol, start_date=start_date, end_date=end_date)
     
         dic_sec = jutil.group_df_to_dict(df_raw, by='symbol')
         dic_sec = {sec: df.set_index('trade_date').loc[:, 'adjust_factor']
@@ -905,7 +1141,7 @@ class RemoteDataService(with_metaclass(Singleton, DataService)):
 
         # align to every trade date
         s, e = df_raw.loc[:, 'trade_date'].min(), df_raw.loc[:, 'trade_date'].max()
-        dates_arr = self.get_trade_date_range(s, e)
+        dates_arr = self.query_trade_dates(s, e)
         if not len(dates_arr) == len(res_final.index):
             res_final = res_final.reindex(dates_arr)
             
@@ -918,7 +1154,7 @@ class RemoteDataService(with_metaclass(Singleton, DataService)):
 
         return res_final
 
-    def get_adj_factor_raw(self, symbol, start_date=None, end_date=None):
+    def query_adj_factor_raw(self, symbol, start_date=None, end_date=None):
         """
         Query adjust factor for symbols.
         
@@ -943,15 +1179,37 @@ class RemoteDataService(with_metaclass(Singleton, DataService)):
                                          'start_date': start_date, 'end_date': end_date})
         fields_list = ['symbol', 'trade_date', 'adjust_factor']
 
-        df_raw, err_msg = self.query("lb.secAdjFactor", fields=','.join(fields_list),
-                                 filter=filter_argument, orderby="symbol")
+        df_raw, err_msg = self.query("lb.secAdjFactor",
+                                     fields=','.join(fields_list),
+                                     filter=filter_argument,
+                                     orderby="symbol")
         self._raise_error_if_msg(err_msg)
         
         df_raw = df_raw.astype(dtype={'symbol': str,
-                                    'trade_date': np.integer,
-                                    'adjust_factor': float
-                                    })
+                                      'trade_date': np.integer,
+                                      'adjust_factor': float
+                                      })
         return df_raw.drop_duplicates()
+    
+    def query_dividend(self, symbol, start_date, end_date):
+        filter_argument = self._dic2url({'symbol': symbol,
+                                         'start_date': start_date,
+                                         'end_date': end_date})
+        df, err_msg = self.query(view="lb.secDividend",
+                                 fields="",
+                                 filter=filter_argument,
+                                 data_format='pandas')
+        
+        # df = df.set_index('exdiv_date').sort_index(axis=0)
+        df = df.astype({'cash': float, 'cash_tax': float,
+                        # 'bonus_list_date': np.integer,
+                        # 'cashpay_date': np.integer,
+                        'exdiv_date': np.integer,
+                        'publish_date': np.integer,
+                        'record_date': np.integer})
+        self._raise_error_if_msg(err_msg)
+        
+        return df, err_msg
     
     def query_inst_info(self, symbol, inst_type="", fields=""):
         if inst_type == "":
@@ -996,7 +1254,7 @@ class RemoteDataService(with_metaclass(Singleton, DataService)):
     # ---------------------------------------------------------------------
     # Calendar
     
-    def get_trade_date_range(self, start_date, end_date):
+    def query_trade_dates(self, start_date, end_date):
         """
         Get array of trade dates within given range.
         Return zero size array if no trade dates within range.
@@ -1016,9 +1274,11 @@ class RemoteDataService(with_metaclass(Singleton, DataService)):
         filter_argument = self._dic2url({'start_date': start_date,
                                          'end_date': end_date})
     
-        df_raw, err_msg = self.query("jz.secTradeCal", fields="trade_date",
-                                     filter=filter_argument, orderby="")
-        self._raise_error_if_msg(err_msg)
+        # df_raw, err_msg = self.query("jz.secTradeCal", fields="trade_date",
+        #                              filter=filter_argument, orderby="")
+        # self._raise_error_if_msg(err_msg)
+        df_raw = self._trade_dates_df[self._trade_dates_df['trade_date'] >= str(start_date)]
+        df_raw = df_raw[df_raw['trade_date'] <= str(end_date)]
         
         if df_raw.empty:
             return np.array([], dtype=int)
@@ -1026,7 +1286,7 @@ class RemoteDataService(with_metaclass(Singleton, DataService)):
         trade_dates_arr = df_raw['trade_date'].values.astype(np.integer)
         return trade_dates_arr
 
-    def get_last_trade_date(self, date):
+    def query_last_trade_date(self, date):
         """
         
         Parameters
@@ -1043,11 +1303,11 @@ class RemoteDataService(with_metaclass(Singleton, DataService)):
         dt_old = dt - delta
         date_old = jutil.convert_datetime_to_int(dt_old)
     
-        dates = self.get_trade_date_range(date_old, date)
+        dates = self.query_trade_dates(date_old, date)
         mask = dates < date
         res = dates[mask][-1]
     
-        return res
+        return int(res)
 
     def is_trade_date(self, date):
         """
@@ -1062,15 +1322,17 @@ class RemoteDataService(with_metaclass(Singleton, DataService)):
         bool
 
         """
-        dates = self.get_trade_date_range(date, date)
+        dates = self.query_trade_dates(date, date)
         return len(dates) > 0
 
-    def get_next_trade_date(self, date):
+    def query_next_trade_date(self, date, n=1):
         """
         
         Parameters
         ----------
         date : int
+        n : int, optional
+            Next n trade dates, default 0 (next trade date).
 
         Returns
         -------
@@ -1078,155 +1340,21 @@ class RemoteDataService(with_metaclass(Singleton, DataService)):
 
         """
         dt = jutil.convert_int_to_datetime(date)
-        delta = pd.Timedelta(weeks=2)
+        delta = pd.Timedelta(weeks=(n // 7 + 2))
         dt_new = dt + delta
         date_new = jutil.convert_datetime_to_int(dt_new)
     
-        dates = self.get_trade_date_range(date, date_new)
+        dates = self.query_trade_dates(date, date_new)
         mask = dates > date
-        res = dates[mask][0]
+        res = dates[mask][n - 1]
     
-        return res
+        return int(res)
 
-        
-
-
-
-'''
-class Calendar_OLD(object):
-    """
-    A calendar for manage trade date.
-    
-    Attributes
-    ----------
-    data_api :
-
-    """
-    
-    def __init__(self, data_api=None):
-        if data_api is None:
-            ds = RemoteDataService()
-            ds.init_from_config()
-            self.data_api = ds
-        else:
-            self.data_api = data_api
-    
-    @staticmethod
-    def _dic2url(d):
-        """
-        Convert a dict to str like 'k1=v1&k2=v2'
-        
-        Parameters
-        ----------
-        d : dict
-
-        Returns
-        -------
-        str
-
-        """
-        l = ['='.join([key, str(value)]) for key, value in d.items()]
-        return '&'.join(l)
-    
-    def get_trade_date_range(self, start_date, end_date):
-        """
-        Get array of trade dates within given range.
-        Return zero size array if no trade dates within range.
-        
-        Parameters
-        ----------
-        start_date : int
-            YYmmdd
-        end_date : int
-
-        Returns
-        -------
-        trade_dates_arr : np.ndarray
-            dtype = int
-
-        """
-        filter_argument = self._dic2url({'start_date': start_date,
-                                         'end_date': end_date})
-        
-        df_raw, err_msg = self.data_api.query("jz.secTradeCal", fields="trade_date",
-                                          filter=filter_argument, orderby="")
-        if df_raw.empty:
-            return np.array([], dtype=int)
-        
-        trade_dates_arr = df_raw['trade_date'].values.astype(int)
-        return trade_dates_arr
-    
-    def get_last_trade_date(self, date):
-        """
-        
-        Parameters
-        ----------
-        date : int
-
-        Returns
-        -------
-        res : int
-
-        """
-        dt = jutil.convert_int_to_datetime(date)
-        delta = pd.Timedelta(weeks=2)
-        dt_old = dt - delta
-        date_old = jutil.convert_datetime_to_int(dt_old)
-        
-        dates = self.get_trade_date_range(date_old, date)
-        mask = dates < date
-        res = dates[mask][-1]
-        
-        return res
-    
-    def is_trade_date(self, date):
-        """
-        Check whether date is a trade date.
-
-        Parameters
-        ----------
-        date : int
-
-        Returns
-        -------
-        bool
-
-        """
-        dates = self.get_trade_date_range(date, date)
-        return len(dates) > 0
-    
-    def get_next_trade_date(self, date):
-        """
-        
-        Parameters
-        ----------
-        date : int
-
-        Returns
-        -------
-        res : int
-
-        """
-        dt = jutil.convert_int_to_datetime(date)
-        delta = pd.Timedelta(weeks=2)
-        dt_new = dt + delta
-        date_new = jutil.convert_datetime_to_int(dt_new)
-        
-        dates = self.get_trade_date_range(date, date_new)
-        mask = dates > date
-        res = dates[mask][0]
-        
-        return res
-
-
-'''
-
-
-
-
-
-
-
-
-
-
+#
+# # test code
+# if __name__ == "__main__":
+#     data_config = jutil.read_json("D:\\whuang_git\\JAQs\\JAQS\\config\\data_config.json")
+#     ds = RemoteDataService()
+#     ds.init_from_config(data_config)
+#     while True:
+#         ds.query_trade_dates("20180501","20180507")

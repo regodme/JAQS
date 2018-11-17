@@ -1,8 +1,19 @@
 # encoding: utf-8
+"""
+Classes defined in backtest module are responsible to run backtests.
+
+They follow a fix procedure, from loading data to looping through
+data and finally save backtest results.
+
+"""
 
 from __future__ import print_function, unicode_literals
+import six
+import abc
+from collections import defaultdict
 import numpy as np
 import pandas as pd
+import datetime as dt
 
 from jaqs.trade import common
 from jaqs.data.basic import Bar
@@ -11,27 +22,67 @@ import jaqs.util as jutil
 from functools import reduce
 
 
-class BacktestInstance(object):
+def generate_cash_trade_ind(symbol, amount, date, time=200000):
+    trade_ind = Trade()
+    trade_ind.symbol = symbol
+    trade_ind.task_id = 0
+    trade_ind.entrust_no = "0"
+    trade_ind.set_fill_info(price=0.0, size=abs(amount), date=date, time=time, no="0", trade_date=date)
+
+    trade_ind2 = Trade()
+    trade_ind2.symbol = symbol
+    trade_ind2.task_id = 0
+    trade_ind2.entrust_no = "0"
+    trade_ind2.set_fill_info(price=1.0, size=abs(amount), date=date, time=time, no="0",trade_date=date)
+
+    if amount > 0:
+        trade_ind.entrust_action = common.ORDER_ACTION.BUY
+        trade_ind2.entrust_action = common.ORDER_ACTION.SELL
+    else:
+        trade_ind.entrust_action = common.ORDER_ACTION.SELL
+        trade_ind2.entrust_action = common.ORDER_ACTION.BUY
+    return trade_ind, trade_ind2
+    
+
+class BacktestInstance(six.with_metaclass(abc.ABCMeta)):
     """
+    BacktestInstance is an abstract base class. It can be derived to implement
+    various backtest tasks.
+    
     Attributes
     ----------
+    
     start_date : int
+        %YY%mm%dd, start date of the backtest.
     end_date : int
+        %YY%mm%dd, end date of the backtest.
+    ctx : Context
+        Running context of the backtest.
+    props : dict
+        props store configurations (settings) of the backtest. Eg: start_date.
     
     """
     def __init__(self):
         super(BacktestInstance, self).__init__()
         
-        self.strategy = None
         self.start_date = 0
         self.end_date = 0
 
         self.props = None
         
         self.ctx = None
-        
+
+        self.commission_rate = 20E-4
+
+        self.POSITION_ADJUST_NO = 101010
+        self.POSITION_ADJUST_TIME = 200000
+        self.DELIST_ADJUST_NO = 202020
+        self.DELIST_ADJUST_TIME = 150000
+
     def init_from_config(self, props):
         """
+        Initialize parameters values for all backtest components such as
+        DataService, PortfolioManager, Strategy, etc.
         
         Parameters
         ----------
@@ -45,6 +96,8 @@ class BacktestInstance(object):
         self.props = props
         self.start_date = props.get("start_date")
         self.end_date = props.get("end_date")
+
+        self.commission_rate = props.get('commission_rate', 20E-4)
         
         if 'symbol' in props:
             self.ctx.init_universe(props['symbol'])
@@ -52,6 +105,9 @@ class BacktestInstance(object):
             self.ctx.init_universe(self.ctx.dataview.symbol)
         else:
             raise ValueError("No dataview, no symbol either.")
+
+        if 'init_balance' not in props:
+            raise ValueError("No [init_balance] provided. Please specify it in props.")
 
         for obj in ['data_api', 'trade_api', 'pm', 'strategy']:
             obj = getattr(self.ctx, obj)
@@ -174,10 +230,16 @@ class AlphaBacktestInstance(BacktestInstance):
     
     Attributes
     ----------
+    last_date : int
+        Last trade date before current trade date.
     last_rebalance_date : int
+        Last re-balance date that we do re-balance.
     current_rebalance_date : int
+        Current re-balance date that we do re-balance.
     univ_price_dic : dict
-        Prices of symbols at current_date
+        Prices of symbols on current trade date.
+    commission_rate : float
+        Ratio of commission charged to turnover for each trade.
 
     """
     def __init__(self):
@@ -186,20 +248,20 @@ class AlphaBacktestInstance(BacktestInstance):
         self.last_date = 0
         self.last_rebalance_date = 0
         self.current_rebalance_date = 0
-        
+
         self.univ_price_dic = {}
-        
-        self.POSITION_ADJUST_NO = 101010
-        self.POSITION_ADJUST_TIME = 200000
-        self.DELIST_ADJUST_NO = 202020
-        self.DELIST_ADJUST_TIME = 150000
-        
-        self.commission_rate = 20E-4
-    
+        self.tmp_univ_price_dic_map = {}
+
     def init_from_config(self, props):
         super(AlphaBacktestInstance, self).init_from_config(props)
-        
-        self.commission_rate = props.get('commission_rate', 20E-4)
+        strategy = self.ctx.strategy
+
+        # universe = props.get('universe', "")
+        # symbol = props.get('symbol', "")
+        # if symbol and universe or len(universe.split('.')) > 1:
+        #     if strategy.pc_method in['index_weight', 'equal_index_weight']:
+        #         raise ValueError("{} shouldn't be used if there are both symbol and universe in props", strategy.pc_method)
+
 
     def position_adjust(self):
         """
@@ -211,14 +273,22 @@ class AlphaBacktestInstance(BacktestInstance):
         """
         start = self.last_rebalance_date  # start will be one day later
         end = self.current_rebalance_date  # end is the same to ensure position adjusted for dividend on rebalance day
-        df_adj = self.ctx.dataview.get_ts('adjust_factor',
-                                          start_date=start, end_date=end)
+        df_adj = self.ctx.dataview.get_ts('_daily_adjust_factor', start_date=start, end_date=end)
+
+        # FIXME: the first day should have been balanced before?
+        df_adj = df_adj[1:]
+
         pm = self.ctx.pm
-        for symbol in pm.holding_securities:
+
+        # Find symbols which has adj_factor not equaling 1
+        tmp = df_adj[df_adj!=1].fillna(0.0).sum()
+        adj_symbols = set(tmp[tmp!=0].index).intersection(pm.holding_securities)
+
+        #for symbol in pm.holding_securities:
+
+        for symbol in adj_symbols:
             ser = df_adj.loc[:, symbol]
-            ser_div = ser.div(ser.shift(1)).fillna(1.0)
-            mask_diff = ser_div != 1
-            ser_adj = ser_div.loc[mask_diff]
+            ser_adj = ser.dropna()
             for date, ratio in ser_adj.iteritems():
                 pos_old = pm.get_position(symbol).current_size
                 # TODO pos will become float, original: int
@@ -234,7 +304,10 @@ class AlphaBacktestInstance(BacktestInstance):
                 trade_ind.task_id = self.POSITION_ADJUST_NO
                 trade_ind.entrust_no = self.POSITION_ADJUST_NO
                 trade_ind.entrust_action = common.ORDER_ACTION.BUY  # for now only BUY
-                trade_ind.set_fill_info(price=0.0, size=pos_diff, date=date, time=200000, no=self.POSITION_ADJUST_NO)
+                trade_ind.set_fill_info(price=0.0, size=pos_diff,
+                                        date=date, time=200000,
+                                        no=self.POSITION_ADJUST_NO,
+                                        trade_date=date)
                 
                 self.ctx.strategy.on_trade(trade_ind)
 
@@ -265,8 +338,12 @@ class AlphaBacktestInstance(BacktestInstance):
             trade_ind.entrust_no = self.DELIST_ADJUST_NO
             trade_ind.entrust_action = common.ORDER_ACTION.SELL  # for now only BUY
             trade_ind.set_fill_info(price=last_close_price, size=pos,
-                                    date=last_trade_date, time=150000, no=self.DELIST_ADJUST_NO)
-    
+                                    date=last_trade_date, time=150000,
+                                    no=self.DELIST_ADJUST_NO,
+                                    trade_date=last_trade_date)
+
+            self.ctx.strategy.cash += trade_ind.fill_price * trade_ind.fill_size
+            #self.ctx.pm.cash += trade_ind.fill_price * trade_ind.fill_size
             self.ctx.strategy.on_trade(trade_ind)
 
     def re_balance_plan_before_open(self):
@@ -282,18 +359,16 @@ class AlphaBacktestInstance(BacktestInstance):
         # only filter index members when universe is defined
         universe_list = self.ctx.universe
         if self.ctx.dataview.universe:
-            col = 'index_member'
-            df_is_member = self.ctx.dataview.get_snapshot(self.ctx.trade_date, fields=col)
+            df_is_member = self.ctx.dataview.get_snapshot(self.ctx.trade_date, fields='index_member')
             df_is_member = df_is_member.fillna(0).astype(bool)
-            dic_index_member = df_is_member.loc[:, col].to_dict()
-            universe_list = [symbol for symbol, value in dic_index_member.items() if value]
+            universe_list = df_is_member[df_is_member['index_member']].index.values
 
         # Step.2 filter out those not listed or already de-listed
         df_inst = self.ctx.dataview.data_inst
         mask = np.logical_and(self.ctx.trade_date > df_inst['list_date'],
                               self.ctx.trade_date < df_inst['delist_date'])
         listing_symbols = df_inst.loc[mask, :].index.values
-        universe_list = [s for s in universe_list if s in listing_symbols]
+        universe_list = np.intersect1d(universe_list, listing_symbols)
         
         # step.3 construct portfolio using models
         self.ctx.strategy.portfolio_construction(universe_list)
@@ -308,18 +383,20 @@ class AlphaBacktestInstance(BacktestInstance):
         Price here must not be adjusted.
 
         """
-        prices = {k: v['close'] for k, v in self.univ_price_dic.items()}
+        prices = {k: v['vwap'] for k, v in self.univ_price_dic.items()}
+
         # suspensions & limit_reaches: list of str
         suspensions = self.get_suspensions()
         limit_reaches = self.get_limit_reaches()
         all_list = reduce(lambda s1, s2: s1.union(s2), [set(suspensions), set(limit_reaches)])
-    
+
         # step1. weights of those suspended and limit will be remove, and weights of others will be re-normalized
         self.ctx.strategy.re_weight_suspension(all_list)
     
         # step2. calculate market value and cash
         # market value does not include those suspended
         market_value_float, market_value_frozen = self.ctx.pm.market_value(prices, all_list)
+        #cash_available = self.ctx.pm.cash + market_value_float
         cash_available = self.ctx.strategy.cash + market_value_float
     
         cash_to_use = cash_available * self.ctx.strategy.position_ratio
@@ -328,21 +405,34 @@ class AlphaBacktestInstance(BacktestInstance):
         # step3. generate target positions
         # position of those suspended will remain the same (will not be traded)
         goals, cash_remain = self.ctx.strategy.generate_weights_order(self.ctx.strategy.weights, cash_to_use, prices,
-                                                                  suspensions=all_list)
+                                                                      suspensions=all_list)
         self.ctx.strategy.goal_positions = goals
+        
+        #self.ctx.pm.cash = cash_remain + cash_unuse
         self.ctx.strategy.cash = cash_remain + cash_unuse
+        #print("cash diff: ", self.ctx.pm.cash - self.ctx.strategy.cash)
         # self.liquidate_all()
         
-        self.ctx.strategy.on_after_rebalance(cash_available + market_value_frozen)
+        total = cash_available + market_value_frozen
+        self.ctx.strategy.on_after_rebalance(total)
+        self.ctx.record('total_cash', total)
 
     def run_alpha(self):
+        print("Run alpha backtest from {0} to {1}".format(self.start_date, self.end_date))
+        begin_time = dt.datetime.now()
+
         tapi = self.ctx.trade_api
-        
-        self.ctx.trade_date = self._get_next_trade_date(self.start_date)
+
+        # Keep compatible, the original test starts with next day, not start_date
+        if self.ctx.strategy.period in ['week', 'month']:
+            self.ctx.trade_date = self._get_first_period_day()
+        else:
+            self.ctx.trade_date = self._get_next_trade_date(self.start_date)
+
         self.last_date = self._get_last_trade_date(self.ctx.trade_date)
         self.current_rebalance_date = self.ctx.trade_date
         while True:
-            print("\n=======new day {}".format(self.ctx.trade_date))
+            print("=======new day {}".format(self.ctx.trade_date))
 
             # match uncome orders or re-balance
             if tapi.match_finished:
@@ -354,34 +444,44 @@ class AlphaBacktestInstance(BacktestInstance):
 
                 # Step2.
                 # plan re-balance before market open of the re-balance day:
-                self.on_new_day(self.last_date)  # use last trade date because strategy can only access data of last day
+
+                # use last trade date because strategy can only access data of last day
+                self.on_new_day(self.last_date)
+
                 # get index memebers, get signals, generate weights
                 self.re_balance_plan_before_open()
 
                 # Step3.
                 # do re-balance on the re-balance day
                 self.on_new_day(self.ctx.trade_date)
+
                 # get suspensions, get up/down limits, generate goal positions and send orders.
                 self.re_balance_plan_after_open()
+
                 self.ctx.strategy.send_bullets()
+
             else:
                 self.on_new_day(self.ctx.trade_date)
-            
+
             # Deal with trade indications
             # results = gateway.match(self.univ_price_dic)
             results = tapi.match_and_callback(self.univ_price_dic)
             for trade_ind, order_status_ind in results:
                 self.ctx.strategy.cash -= trade_ind.commission
+                #self.ctx.pm.cash -= trade_ind.commission
                 
             self.on_after_market_close()
-            
+
             # switch trade date
             backtest_finish = self.go_next_rebalance_day()
             if backtest_finish:
                 break
-        
-        print("Backtest done. {:d} days, {:.2e} trades in total.".format(len(self.ctx.dataview.dates),
-                                                                         len(self.ctx.pm.trades)))
+
+        used_time = (dt.datetime.now() - begin_time).total_seconds()
+        print("Backtest done. {0:d} days, {1:.2e} trades in total. used time: {2}s".
+              format(len(self.ctx.dataview.dates), len(self.ctx.pm.trades), used_time))
+
+        jutil.prof_print()
     
     def on_after_market_close(self):
         self.ctx.trade_api.on_after_market_close()
@@ -400,13 +500,13 @@ class AlphaBacktestInstance(BacktestInstance):
         else:
             return self.ctx.data_api.is_trade_date(date)
     
-    def _get_next_trade_date(self, date):
+    def _get_next_trade_date(self, date, n=1):
         if self.ctx.dataview is not None:
             dates = self.ctx.dataview.dates
             mask = dates > date
-            return dates[mask][0]
+            return dates[mask][n-1]
         else:
-            return self.ctx.data_api.get_next_trade_date(date)
+            return self.ctx.data_api.query_next_trade_date(date, n)
     
     def _get_last_trade_date(self, date):
         if self.ctx.dataview is not None:
@@ -414,8 +514,120 @@ class AlphaBacktestInstance(BacktestInstance):
             mask = dates < date
             return dates[mask][-1]
         else:
-            return self.ctx.data_api.get_last_trade_date(date)
-    
+            return self.ctx.data_api.query_last_trade_date(date)
+
+    def _get_first_period_day(self):
+
+        current = self.start_date
+
+        current_date = jutil.convert_int_to_datetime(current)
+        period = self.ctx.strategy.period
+
+        # set current date to first date of current period
+        # set offset to first date of previous period
+        if period == 'day':
+            offset = pd.tseries.offsets.BDay()
+        elif period == 'week':
+            offset = pd.tseries.offsets.Week(weekday=0)
+            current_date -= pd.tseries.offsets.Day(current_date.weekday())
+        elif period == 'month':
+            offset = pd.tseries.offsets.BMonthBegin()
+            current_date -= pd.tseries.offsets.Day(current_date.day - 1)
+        else:
+            raise NotImplementedError("Frequency as {} not support".format(period))
+
+        current_date -= offset * self.ctx.strategy.n_periods;
+
+        current = jutil.convert_datetime_to_int(current_date)
+
+        return self._get_next_period_day(current, self.ctx.strategy.period,
+                                         n=self.ctx.strategy.n_periods,
+                                         extra_offset=self.ctx.strategy.days_delay)
+
+    def _get_next_period_day(self, current, period, n=1, extra_offset=0):
+        """
+        Get the n'th day in next period from current day.
+
+        Parameters
+        ----------
+        current : int
+            Current date in format "%Y%m%d".
+        period : str
+            Interval between current and next. {'day', 'week', 'month'}
+        n : int
+            n times period.
+        extra_offset : int
+            n'th business day after next period.
+
+        Returns
+        -------
+        nxt : int
+
+        """
+        #while True:
+        #for _ in range(4):
+
+        current_date = jutil.convert_int_to_datetime(current)
+        while current <= self.end_date:
+            if period == 'day':
+                offset = pd.tseries.offsets.BDay()  # move to next business day
+                if extra_offset < 0:
+                    raise ValueError("Wrong offset for day period")
+            elif period == 'week':
+                offset = pd.tseries.offsets.Week(weekday=0)  # move to next Monday
+                if extra_offset < -5 :
+                    raise ValueError("Wrong offset for week period")
+            elif period == 'month':
+                offset = pd.tseries.offsets.BMonthBegin()  # move to first business day of next month
+                if extra_offset < -31:
+                    raise  ValueError("Wrong offset for month period")
+            else:
+                raise NotImplementedError("Frequency as {} not support".format(period))
+
+            offset = offset * n
+
+            begin_date = current_date + offset
+            if period == 'day':
+                end_date = begin_date + pd.tseries.offsets.Day()*366
+            elif period == 'week':
+                end_date   = begin_date + pd.tseries.offsets.Day() * 6
+            elif period == 'month':
+                end_date = begin_date + pd.tseries.offsets.BMonthBegin() #- pd.tseries.offsets.BDay()
+
+
+            if extra_offset > 0 :
+                next_date = begin_date + extra_offset * pd.tseries.offsets.BDay()
+                if next_date >= end_date:
+                    next_date = end_date - pd.tseries.offsets.BDay()
+            elif extra_offset < 0:
+                next_date = end_date + extra_offset * pd.tseries.offsets.BDay()
+                if next_date < begin_date:
+                    next_date = begin_date
+            else:
+                next_date = begin_date
+
+            date = next_date
+            while date < end_date:
+                nxt = jutil.convert_datetime_to_int(date)
+                if self._is_trade_date(nxt):
+                    return nxt
+                date += pd.tseries.offsets.BDay()
+
+            date = next_date
+            while date >= begin_date:
+                nxt = jutil.convert_datetime_to_int(date)
+                if self._is_trade_date(nxt):
+                    return nxt
+                date -= pd.tseries.offsets.BDay()
+
+            # no trading day in this period, try next period
+            current_date = end_date - pd.tseries.offsets.BDay()
+            current = jutil.convert_datetime_to_int( current_date)
+            # Check if there are more trade dates
+            self._get_next_trade_date(current)
+
+        raise ValueError("no trading day after {0}".format(current))
+
     def go_next_rebalance_day(self):
         """
         update self.ctx.trade_date and last_date.
@@ -428,21 +640,38 @@ class AlphaBacktestInstance(BacktestInstance):
         """
         current_date = self.ctx.trade_date
         if self.ctx.trade_api.match_finished:
-            next_period_day = jutil.get_next_period_day(current_date, self.ctx.strategy.period,
-                                                        n=self.ctx.strategy.n_periods,
-                                                        extra_offset=self.ctx.strategy.days_delay)
-            if next_period_day > self.end_date:
-                return True
-            
-            # update current_date: next_period_day is a workday, but not necessarily a trade date
-            if self._is_trade_date(next_period_day):
-                current_date = next_period_day
-            else:
+            if self.ctx.strategy.period == 'day':
+                # use trade dates array
                 try:
-                    current_date = self._get_next_trade_date(next_period_day)
+                    current_date = self._get_next_trade_date(current_date, self.ctx.strategy.n_periods)
                 except IndexError:
                     return True
-        
+            else:
+                # use natural week/month
+                # next_period_day = jutil.get_next_period_day(current_date, self.ctx.strategy.period,
+                #                                             n=self.ctx.strategy.n_periods,
+                #                                             extra_offset=self.ctx.strategy.days_delay)
+                # # update current_date: next_period_day is a workday, but not necessarily a trade date
+                # if self._is_trade_date(next_period_day):
+                #     current_date = next_period_day
+                # else:
+                #     try:
+                #         current_date = self._get_next_trade_date(next_period_day)
+                #     except IndexError:
+                #         return True
+
+                try:
+                    current_date = self._get_next_period_day(current_date, self.ctx.strategy.period,
+                                                            n=self.ctx.strategy.n_periods,
+                                                            extra_offset=self.ctx.strategy.days_delay)
+                except ValueError:
+                    return True
+                except IndexError:
+                    return True
+
+            if current_date > self.end_date:
+                return True
+
             # update re-balance date
             if self.current_rebalance_date > 0:
                 self.last_rebalance_date = self.current_rebalance_date
@@ -469,19 +698,25 @@ class AlphaBacktestInstance(BacktestInstance):
 
     def get_limit_reaches(self):
         # TODO: 10% is not the absolute value to check limit reach
-        df_open = self.ctx.dataview.get_snapshot(self.ctx.trade_date, fields='open')
-        df_close = self.ctx.dataview.get_snapshot(self.last_date, fields='close')
-        merge = pd.concat([df_close, df_open], axis=1)
-        merge.loc[:, 'limit'] = np.abs((merge['open'] - merge['close']) / merge['close']) > 9.5E-2
-        return list(merge.loc[merge.loc[:, 'limit'], :].index.values)
+        df = self.ctx.dataview.get_snapshot(self.ctx.trade_date, fields="_limit")
+        df = df[df > 9.5E-2].dropna()
+        return df.index.values
     
     def on_new_day(self, date):
         # self.ctx.strategy.on_new_day(date)
         self.ctx.trade_api.on_new_day(date)
-        
         self.ctx.snapshot = self.ctx.dataview.get_snapshot(date)
-        self.univ_price_dic = self.ctx.snapshot.loc[:, ['close', 'vwap', 'open', 'high', 'low']].to_dict(orient='index')
-    
+
+        # temporary fix, tzxu
+        # Can univ_price_dic has DataFrame format?
+        if date in self.tmp_univ_price_dic_map:
+            self.univ_price_dic = self.tmp_univ_price_dic_map[date]
+        else:
+            # self.univ_price_dic = self.ctx.snapshot.to_dict(orient='index')
+            #self.univ_price_dic = self.ctx.snapshot.loc[:, ['close', 'vwap', 'open', 'high', 'low']].to_dict(orient='index')
+            self.univ_price_dic = self.ctx.snapshot.to_dict(orient='index')
+            self.tmp_univ_price_dic_map[date] = self.univ_price_dic
+
     def save_results(self, folder_path='.'):
         import os
         import pandas as pd
@@ -498,7 +733,8 @@ class AlphaBacktestInstance(BacktestInstance):
                     'fill_date': np.integer,
                     'fill_time': np.integer,
                     'fill_no': str,
-                    'commission': float}
+                    'commission': float,
+                    'trade_date': np.integer}
         # keys = trades[0].__dict__.keys()
         ser_list = dict()
         for key in type_map.keys():
@@ -530,21 +766,80 @@ class AlphaBacktestInstance(BacktestInstance):
 
 
 class EventBacktestInstance(BacktestInstance):
+    """
+    Backtest event-driven strategy using DataService.
+    
+    Attributes
+    ----------
+    bar_type : str
+        {'1d', '1M', '5M', etc.}
+    
+    """
     def __init__(self):
         super(EventBacktestInstance, self).__init__()
         
         self.bar_type = ""
+        self.df_dividend = None
         
     def init_from_config(self, props):
         super(EventBacktestInstance, self).init_from_config(props)
         
         self.bar_type = props.get("bar_type", "1d")
-        
-    def go_next_trade_date(self):
-        next_dt = self.ctx.data_api.get_next_trade_date(self.ctx.trade_date)
-        
-        self.ctx.trade_date = next_dt
     
+    def _get_dividend_info(self):
+        """
+        Query dividend information of stocks for use of daily settlement.
+        
+        """
+        if self.ctx.data_api is not None:
+            symbol_str = ','.join(self.ctx.universe)
+            df, msg = self.ctx.data_api.query_dividend(symbol_str, start_date=self.start_date, end_date=self.end_date)
+            df.loc[:, 'shares'] = (df['share_ratio'] + df['share_trans_ratio']) # / 10.0
+            df.loc[:, 'cash_tax'] = df['cash_tax'] # / 10.0
+            self.df_dividend = df
+        else:
+            # TODO
+            pass
+        
+    def settle_for_stocks(self, last_date, date):
+        if self.df_dividend is None:
+            return
+        
+        df = self.df_dividend.loc[(self.df_dividend['exdiv_date'] > last_date) & (self.df_dividend['exdiv_date'] <= date)]
+        if df.empty:
+            return
+        df2 = df.set_index('symbol')
+        for symbol in df2.index:
+            if symbol in self.ctx.pm.holding_securities:
+                df_symbol = df2.loc[symbol]
+                shares_ratio = df_symbol['shares']
+                cash_ratio = df_symbol['cash_tax']
+                pos = self.ctx.pm.get_position(symbol).current_size
+                
+                if cash_ratio > 0:
+                    cash_added = cash_ratio * pos
+                    #self.ctx.pm.cash += cash_added
+                    trade_ind1, trade_ind2 = generate_cash_trade_ind(symbol, cash_added, date, 60000)
+                    self.ctx.strategy.on_trade(trade_ind1)
+                    self.ctx.strategy.on_trade(trade_ind2)
+                    
+                if shares_ratio > 0:
+                    pos_diff = abs(pos * shares_ratio)
+                    trade_ind = Trade()
+                    trade_ind.symbol = symbol
+                    trade_ind.task_id = self.POSITION_ADJUST_NO
+                    trade_ind.entrust_no = self.POSITION_ADJUST_NO
+                    if pos > 0:
+                        trade_ind.entrust_action = common.ORDER_ACTION.BUY
+                    else:
+                        trade_ind.entrust_action = common.ORDER_ACTION.SELL
+                    trade_ind.set_fill_info(price=0.0, size=pos_diff,
+                                            date=date, time=60000,
+                                            no=self.POSITION_ADJUST_NO,
+                                            trade_date=date)
+                    
+                    self.ctx.strategy.on_trade(trade_ind)
+            
     def on_new_day(self, date):
         self.ctx.trade_date = date
         self.ctx.time = 0
@@ -557,97 +852,176 @@ class EventBacktestInstance(BacktestInstance):
     
     def on_after_market_close(self):
         pass
-
-    def _create_time_symbol_bars(self, date):
-        from collections import defaultdict
         
+    def _get_df_bar(self, symbols, date):
+        """
+        Get bar DataFrame from DataApi or DataView.
+        
+        Parameters
+        ----------
+        symbols : str
+        date : int
+
+        Returns
+        -------
+        res : pd.DataFrame
+
+        """
+        if self.ctx.dataview is not None:
+            df_quotes = self.ctx.dataview.get(symbol=symbols,
+                                              start_date=date, end_date=date,
+                                              fields='open,high,low,close,volume,oi,trade_date,date,time',
+                                              data_format='long')
+        elif self.ctx.data_api is not None:
+            df_quotes, _ = self.ctx.data_api.bar(symbol=symbols,
+                                                   start_time=200000, end_time=160000, trade_date=date,
+                                                   freq=self.bar_type)
+        else:
+            raise ValueError()
+        
+        return df_quotes
+            
+    def _create_time_symbol_bars(self, date):
+        """
+        Given a trade date, query bars of all symbols on that day and return a nested dict.
+        
+        Parameters
+        ----------
+        date : int
+            Trade date.
+
+        Returns
+        -------
+        res : list of tuples
+            Three-element tuple: (trade_date, time, dict of quote)
+
+        """
         # query quotes data
         symbols_str = ','.join(self.ctx.universe)
-        df_quotes, msg = self.ctx.data_api.bar(symbol=symbols_str, start_time=200000, end_time=160000,
-                                               trade_date=date, freq=self.bar_type)
-        if msg != '0,':
-            print(msg)
+        df_quotes = self._get_df_bar(symbols_str, date)
         if df_quotes is None or df_quotes.empty:
             return dict()
     
         # create nested dict
-        quotes_list = Bar.create_from_df(df_quotes)
-        
-        dic = defaultdict(dict)
-        for quote in quotes_list:
-            dic[jutil.combine_date_time(quote.date, quote.time)][quote.symbol] = quote
-        return dic
+        df_quotes = df_quotes.sort_values(['date', 'time', 'symbol'])
+        res = []
+        for time, df in df_quotes.groupby(by=['time'], sort=False):
+            quotes_list = Bar.create_from_df(df)
+            dic = {quote.symbol: quote for quote in quotes_list}
+            res.append((time, dic))
+        return res
     
     def _run_bar(self):
         """Quotes of different symbols will be aligned into one dictionary."""
-        trade_dates = self.ctx.data_api.get_trade_date_range(self.start_date, self.end_date)
+        trade_dates_arr = self.ctx.data_api.query_trade_dates(self.start_date, self.end_date)
 
-        for trade_date in trade_dates:
+        last_trade_date = trade_dates_arr[0]
+        for trade_date in trade_dates_arr:
+            self.settle_for_stocks(last_trade_date, trade_date)
             self.on_new_day(trade_date)
             
-            quotes_dic = self._create_time_symbol_bars(trade_date)
-            for dt in sorted(quotes_dic.keys()):
-                _, time = jutil.split_date_time(dt)
-                self.ctx.time = time
-                
-                quote_by_symbol = quotes_dic.get(dt)
-                self._process_quote_bar(quote_by_symbol)
+            list_of_quotes_tuples = self._create_time_symbol_bars(trade_date)
+            for time, quotes_dic in list_of_quotes_tuples:
+                self._process_quote_bar(quotes_dic)
             
             self.on_after_market_close()
-    
-    def _run_daily(self):
-        """Quotes of different symbols will be aligned into one dictionary."""
-        from collections import defaultdict
+            last_trade_date = trade_date
+
+    def _get_df_daily(self, symbol, start_date, end_date):
+        """
+        Get bar DataFrame from DataApi or DataView.
         
+        Parameters
+        ----------
+        symbol : str or unicode
+        start_date : int
+        end_date : int
+
+        Returns
+        -------
+        res : pd.DataFrame
+
+        """
+        if self.ctx.dataview is not None:
+            df_daily = self.ctx.dataview.get(symbol=symbol,
+                                             start_date=start_date, end_date=end_date,
+                                             fields='open,high,low,close,volume,oi,trade_date,time',
+                                             data_format='long')
+        elif self.ctx.data_api is not None:
+            df_daily, _ = self.ctx.data_api.daily(symbol=symbol,
+                                                  start_date=start_date, end_date=end_date,
+                                                  adjust_mode=None)
+        else:
+            raise ValueError()
+    
+        return df_daily
+
+    def _create_daily_symbol_bars(self, start_date, end_date):
+        """
+        Given a trade date range, query daily bars of all symbols in that range and return a list.
+        
+        Parameters
+        ----------
+        start_date : int
+            Trade date.
+        end_date : int
+            Trade date.
+
+        Returns
+        -------
+        res : list of tuples
+            Two-element tuple: (trade_date, dict of quotes)
+
+        """
+        # query quotes data
         symbols_str = ','.join(self.ctx.universe)
-        df_daily, msg = self.ctx.data_api.daily(symbol=symbols_str, start_date=self.start_date, end_date=self.end_date,
-                                                adjust_mode='post')
-        if msg != '0,':
-            print(msg)
+        df_daily = self._get_df_daily(symbol=symbols_str, start_date=start_date, end_date=end_date)
+        df_daily['date'] = df_daily['trade_date']
         if df_daily is None or df_daily.empty:
             return dict()
-        
-        # create nested dict
-        quotes_list = Bar.create_from_df(df_daily)
 
-        dic = defaultdict(dict)
-        for quote in quotes_list:
-            dic[quote.trade_date][quote.symbol] = quote
+        # create nested dict
+        df_daily = df_daily.sort_values(['trade_date', 'symbol'])
+        res = []
+        for date, df in df_daily.groupby(by='trade_date'):
+            quotes_list = Bar.create_from_df(df)
+            dic = {quote.symbol: quote for quote in quotes_list}
+            res.append((date, dic))
+    
+        return res
+
+    def _run_daily(self):
+        """Quotes of different symbols will be aligned into one dictionary."""
+        # create nested dict
+        list_of_quotes_tuples = self._create_daily_symbol_bars(self.start_date, self.end_date)
         
-        dates = sorted(dic.keys())
-        for i in range(len(dates) - 1):
-            d1, d2 = dates[i], dates[i + 1]
-            self.on_new_day(d2)
+        for i in range(len(list_of_quotes_tuples) - 1):
+            date1, quotes_dic1 = list_of_quotes_tuples[i]
+            date2, quotes_dic2 = list_of_quotes_tuples[i + 1]
+            self.on_new_day(date2)
             
-            quote1 = dic.get(d1)
-            quote2 = dic.get(d2)
-            self._process_quote_daily(quote1, quote2)
+            self._process_quote_daily(quotes_dic1, quotes_dic2)
             
             self.on_after_market_close()
+            self.settle_for_stocks(date1, date2)
     
     def _process_quote_daily(self, quote_yesterday, quote_today):
         # on_bar
         self.ctx.strategy.on_bar(quote_yesterday)
         
         self.ctx.trade_api.match_and_callback(quote_today, freq=self.bar_type)
-        
-        '''
-        # match
-        trade_results = self.ctx.gateway._process_quote(quote_today, freq=self.bar_type)
-
-        # trade indication
-        for trade_ind, status_ind in trade_results:
-            comm = self.calc_commission(trade_ind)
-            trade_ind.commission = comm
-            # self.ctx.strategy.cash -= comm
-            
-            self.ctx.strategy.on_trade(trade_ind)
-            self.ctx.strategy.on_order_status(status_ind)
-        '''
-        
+  
         self.on_after_market_close()
 
+    def _process_quote_bar(self, quotes_dic):
+        results = self.ctx.trade_api.match_and_callback(quotes_dic, freq=self.bar_type)
+    
+        # on_bar
+        self.ctx.strategy.on_bar(quotes_dic)
+
     def run(self):
+        self._get_dividend_info()
+        
         if self.bar_type == common.QUOTE_TYPE.DAILY:
             self._run_daily()
         
@@ -661,31 +1035,6 @@ class EventBacktestInstance(BacktestInstance):
         
         print("Backtest done.")
         
-    def _process_quote_bar(self, quotes_dic):
-        self.ctx.trade_api.match_and_callback(quotes_dic, freq=self.bar_type)
-        
-        '''
-        # match
-        trade_results = self.ctx.trade_api._process_quote(quotes_dic, freq=self.bar_type)
-        
-        # trade indication
-        for trade_ind, status_ind in trade_results:
-            comm = self.calc_commission(trade_ind)
-            trade_ind.commission = comm
-            # self.ctx.strategy.cash -= comm
-    
-            self.ctx.strategy.on_trade(trade_ind)
-            self.ctx.strategy.on_order_status(status_ind)
-        '''
-        
-        # on_bar
-        self.ctx.strategy.on_bar(quotes_dic)
-
-    '''
-    def generate_report(self, output_format=""):
-        return self.pnlmgr.generateReport(output_format)
-    '''
-    
     def save_results(self, folder_path='.'):
         import os
         import pandas as pd
@@ -702,7 +1051,8 @@ class EventBacktestInstance(BacktestInstance):
                     'fill_date': np.integer,
                     'fill_time': np.integer,
                     'fill_no': str,
-                    'commission': float}
+                    'commission': float,
+                    'trade_date': np.integer}
         # keys = trades[0].__dict__.keys()
         ser_list = dict()
         for key in type_map.keys():
@@ -720,58 +1070,3 @@ class EventBacktestInstance(BacktestInstance):
         jutil.save_json(self.props, configs_fn)
     
         print ("Backtest results has been successfully saved to:\n" + folder_path)
-    
-    '''
-    def run_event(self):
-        data_api = self.ctx.data_api
-        universe = self.ctx.universe
-        
-        data_api.add_batch_subscribe(self, universe)
-        
-        self.ctx.trade_date = self.start_date
-        
-        def __extract(func):
-            return lambda event: func(event.data, **event.kwargs)
-        
-        ee = self.ctx.strategy.eventEngine  # TODO event-driven way of lopping, is it proper?
-        ee.register(EVENT.CALENDAR_NEW_TRADE_DATE, __extract(self.ctx.strategy.on_new_day))
-        ee.register(EVENT.MD_QUOTE, __extract(self._process_quote_bar))
-        ee.register(EVENT.MARKET_CLOSE, __extract(self.close_day))
-        
-        while self.ctx.trade_date <= self.end_date:  # each loop is a new trading day
-            quotes = data_api.get_daily_quotes(self.ctx.trade_date)
-            if quotes is not None:
-                # gateway.oneNewDay()
-                e_newday = Event(EVENT.CALENDAR_NEW_TRADE_DATE)
-                e_newday.data = self.ctx.trade_date
-                ee.put(e_newday)
-                ee.process_once()  # this line should be done on another thread
-                
-                # self.ctx.strategy.onNewday(self.ctx.trade_date)
-                self.ctx.strategy.pm.on_new_day(self.ctx.trade_date, self.last_date)
-                self.ctx.strategy.ctx.trade_date = self.ctx.trade_date
-                
-                for quote in quotes:
-                    # self.processQuote(quote)
-                    e_quote = Event(EVENT.MD_QUOTE)
-                    e_quote.data = quote
-                    ee.put(e_quote)
-                    ee.process_once()
-                
-                # self.ctx.strategy.onMarketClose()
-                # self.closeDay(self.ctx.trade_date)
-                e_close = Event(EVENT.MARKET_CLOSE)
-                e_close.data = self.ctx.trade_date
-                ee.put(e_close)
-                ee.process_once()
-                # self.ctx.strategy.onSettle()
-                
-            else:
-                # no quotes because of holiday or other issues. We don't update last_date
-                print "in trade.py: function run(): {} quotes is None, continue.".format(self.last_date)
-            
-            self.ctx.trade_date = self.go_next_trade_date(self.ctx.trade_date)
-            
-            # self.ctx.strategy.onTradingEnd()
-
-    '''
